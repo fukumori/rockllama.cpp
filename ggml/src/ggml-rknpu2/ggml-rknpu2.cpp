@@ -1226,7 +1226,13 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
-    return get_tensor_packed_size(tensor);
+    const size_t packed_size = get_tensor_packed_size(tensor);
+    const size_t nbytes = ggml_nbytes(tensor);
+
+    // ggml requires backend allocation size to cover the original tensor bytes.
+    // RKNPU may repack weights into a denser device layout, but model loading can
+    // still read/copy ggml_nbytes() worth of source data during initialization.
+    return std::max(packed_size, nbytes);
 }
 
 
