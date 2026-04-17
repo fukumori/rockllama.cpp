@@ -1288,6 +1288,16 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
+            // The current RKNPU matmul path only handles plain 2D matrices.
+            // Batched / higher-rank ggml_mul_mat tensors require semantics that
+            // depend on ne[2]/ne[3], but the implementation below only uses K/N/M
+            // from ne[0]/ne[1]. Reject them so they fall back to CPU.
+            if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+                src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                op->ne[2]   != 1 || op->ne[3]   != 1) {
+                return false;
+            }
+
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
