@@ -1,0 +1,82 @@
+name: Sync Check
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # toda segunda-feira às 6h UTC
+  workflow_dispatch:       # permite execução manual
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout rockllama.cpp
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream and rknpu2 remotes
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git remote add rknpu2 https://github.com/invisiofficial/rk-llama.cpp.git
+          git fetch upstream master --quiet
+          git fetch rknpu2 rknpu2 --quiet
+
+      - name: Check divergence from upstream
+        id: divergence
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          AHEAD=$(git rev-list --count upstream/master..HEAD)
+          RKNPU2_NEW=$(git rev-list --count rknpu2/rknpu2..upstream/master || echo "N/A")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "## Status de sincronização - $(date +%Y-%m-%d)"
+          echo "- Commits atrás do upstream (ggml-org/llama.cpp): $BEHIND"
+          echo "- Commits à frente do upstream: $AHEAD"
+          echo "- Commits novos no rknpu2 desde upstream: $RKNPU2_NEW"
+
+      - name: Test rknpu2 patches still apply
+        id: patch_test
+        run: |
+          git config user.email "ci@rockllama"
+          git config user.name "CI Bot"
+          git checkout -b ci/patch-test-${{ github.run_id }} upstream/master
+          FAIL=0
+          for patch in patches/*.patch; do
+            echo "Testando: $patch"
+            if ! git am "$patch" 2>&1; then
+              echo "::error::Patch falhou: $patch"
+              git am --abort 2>/dev/null || true
+              FAIL=1
+              break
+            fi
+          done
+          echo "patch_ok=$([ $FAIL -eq 0 ] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
+          if [ $FAIL -eq 0 ]; then
+            echo "Todos os patches aplicados com sucesso!"
+          fi
+
+      - name: Warn if significantly behind upstream
+        if: steps.divergence.outputs.behind > 100
+        run: |
+          echo "::warning::Repositório está ${{ steps.divergence.outputs.behind }} commits atrás do upstream! Considere fazer sync."
+
+      - name: Fail if patches broke
+        if: steps.patch_test.outputs.patch_ok == 'false'
+        run: |
+          echo "::error::Os patches do rknpu2 não aplicam mais sobre o upstream atual. Atualize os patches!"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "# Resultado do Sync Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Métrica | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commits atrás do upstream | ${{ steps.divergence.outputs.behind }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Patches RKNPU2 OK | ${{ steps.patch_test.outputs.patch_ok }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Data | $(date +%Y-%m-%d) |" >> "$GITHUB_STEP_SUMMARY"

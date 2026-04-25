@@ -1,0 +1,2052 @@
+From 74d51a2f6504247bf32f0b1a69004d434426b53b Mon Sep 17 00:00:00 2001
+From: Invisi <invisiofficial@gmail.com>
+Date: Sun, 2 Nov 2025 14:43:37 +0700
+Subject: [PATCH 04/11] Quantization support is implemented
+
+---
+ ggml/src/ggml-rknpu2/CMakeLists.txt           |   5 +-
+ ggml/src/ggml-rknpu2/dma-alloc.cpp            |  54 --
+ ggml/src/ggml-rknpu2/dma-alloc.h              |  30 -
+ ggml/src/ggml-rknpu2/ggml-rknpu2.cpp          | 657 ++++++++++++------
+ ggml/src/ggml-rknpu2/rknpu2-allocation.cpp    |  77 ++
+ ggml/src/ggml-rknpu2/rknpu2-allocation.h      |  43 ++
+ ggml/src/ggml-rknpu2/rknpu2-calibration.cpp   | 243 +++++++
+ ggml/src/ggml-rknpu2/rknpu2-calibration.h     |  68 ++
+ ggml/src/ggml-rknpu2/rknpu2-configuration.cpp | 192 +++++
+ ggml/src/ggml-rknpu2/rknpu2-configuration.h   | 136 ++++
+ ggml/src/ggml-rknpu2/rknpu2-quantization.cpp  |  82 +++
+ ggml/src/ggml-rknpu2/rknpu2-quantization.h    |  83 +++
+ 12 files changed, 1379 insertions(+), 291 deletions(-)
+ delete mode 100644 ggml/src/ggml-rknpu2/dma-alloc.cpp
+ delete mode 100644 ggml/src/ggml-rknpu2/dma-alloc.h
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-allocation.cpp
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-allocation.h
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-calibration.cpp
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-calibration.h
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-configuration.cpp
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-configuration.h
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-quantization.cpp
+ create mode 100644 ggml/src/ggml-rknpu2/rknpu2-quantization.h
+
+diff --git a/ggml/src/ggml-rknpu2/CMakeLists.txt b/ggml/src/ggml-rknpu2/CMakeLists.txt
+index 407de9f7c..d78d2b405 100644
+--- a/ggml/src/ggml-rknpu2/CMakeLists.txt
++++ b/ggml/src/ggml-rknpu2/CMakeLists.txt
+@@ -4,7 +4,10 @@ find_package(OpenMP REQUIRED)
+ # Adding backend files
+ ggml_add_backend_library(ggml-rknpu2
+     ggml-rknpu2.cpp
+-    dma-alloc.cpp
++    rknpu2-allocation.cpp
++    rknpu2-quantization.cpp
++    rknpu2-calibration.cpp
++    rknpu2-configuration.cpp
+ )
+ 
+ # Linking rknpu2 header files
+diff --git a/ggml/src/ggml-rknpu2/dma-alloc.cpp b/ggml/src/ggml-rknpu2/dma-alloc.cpp
+deleted file mode 100644
+index 29ebd0b78..000000000
+--- a/ggml/src/ggml-rknpu2/dma-alloc.cpp
++++ /dev/null
+@@ -1,54 +0,0 @@
+-#include "dma-alloc.h"
+-#include <sys/ioctl.h>
+-#include <sys/mman.h>
+-#include <fcntl.h>
+-#include <unistd.h>
+-#include <string.h>
+-#include <cerrno>
+-#include <cstdio>
+-
+-DmaBuffer dma_alloc(size_t size) {
+-    DmaBuffer buffer;
+-    buffer.size = size;
+-
+-    const char* path = "/dev/dma_heap/system";
+-    int dma_heap_fd = open(path, O_RDWR);
+-    if (dma_heap_fd < 0) {
+-        fprintf(stderr, "DMA_ALLOC: Failed to open %s: %s\n", path, strerror(errno));
+-        return buffer;
+-    }
+-
+-    dma_heap_allocation_data buf_data;
+-    memset(&buf_data, 0, sizeof(buf_data));
+-    buf_data.len = size;
+-    buf_data.fd_flags = O_CLOEXEC | O_RDWR;
+-
+-    if (ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data) < 0) {
+-        fprintf(stderr, "DMA_ALLOC: ioctl DMA_HEAP_IOCTL_ALLOC failed: %s\n", strerror(errno));
+-        close(dma_heap_fd);
+-        return buffer;
+-    }
+-
+-    close(dma_heap_fd);
+-
+-    buffer.fd = buf_data.fd;
+-    buffer.virt_addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
+-
+-    if (buffer.virt_addr == MAP_FAILED) {
+-        fprintf(stderr, "DMA_ALLOC: mmap failed: %s\n", strerror(errno));
+-        close(buffer.fd);
+-        buffer.fd = -1;
+-        buffer.virt_addr = nullptr;
+-    }
+-
+-    return buffer;
+-}
+-
+-void dma_free(const DmaBuffer& buffer) {
+-    if (buffer.virt_addr) {
+-        munmap(buffer.virt_addr, buffer.size);
+-    }
+-    if (buffer.fd >= 0) {
+-        close(buffer.fd);
+-    }
+-}
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/dma-alloc.h b/ggml/src/ggml-rknpu2/dma-alloc.h
+deleted file mode 100644
+index f5efa3ba3..000000000
+--- a/ggml/src/ggml-rknpu2/dma-alloc.h
++++ /dev/null
+@@ -1,30 +0,0 @@
+-#pragma once
+-
+-#include <cstddef>
+-#include <cstdint>
+-
+-// --- Structs ---
+-struct dma_heap_allocation_data {
+-    uint64_t len;
+-    uint32_t fd;
+-    uint32_t fd_flags;
+-    uint64_t heap_flags;
+-};
+-
+-// --- IOCTL-commands ---
+-
+-#define DMA_HEAP_IOC_MAGIC 'H'
+-#define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+-
+-// Information of allocated block
+-struct DmaBuffer {
+-    int fd = -1;
+-    void* virt_addr = nullptr;
+-    size_t size = 0;
+-};
+-
+-// --- Functions ---
+-
+-DmaBuffer dma_alloc(size_t size);
+-
+-void dma_free(const DmaBuffer& buffer);
+diff --git a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+index 2d5edc604..b9874f25a 100644
+--- a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
++++ b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+@@ -3,7 +3,10 @@
+ #include "ggml-impl.h"
+ #include "ggml-quants.h"
+ 
+-#include "dma-alloc.h"
++#include "rknpu2-allocation.h"
++#include "rknpu2-quantization.h"
++#include "rknpu2-calibration.h"
++#include "rknpu2-configuration.h"
+ 
+ #include <rknn_api.h>
+ #include <rknn_matmul_api.h>
+@@ -22,91 +25,22 @@
+ #include <algorithm>
+ #include <memory>
+ #include <unordered_map>
++#include <random>
++#include <limits>
+ 
+ #define UNUSED(x) (void)(x)
+ 
+-// Performance logging flag
+-#define RKNPU_PERF_LOG 0
+-
+-// Backend logging flag
+-#define RKNPU_DEBUG 0
+-
+-// RAII-struct for performance logging
+-#if RKNPU_PERF_LOG
+-struct RknpuPerfLogger {
+-    std::string name;
+-    std::chrono::high_resolution_clock::time_point start;
+-
+-    RknpuPerfLogger(std::string name) : name(std::move(name)), start(std::chrono::high_resolution_clock::now()) {}
+-
+-    ~RknpuPerfLogger() {
+-        auto end = std::chrono::high_resolution_clock::now();
+-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+-        fprintf(stderr, "[PERF] %-40s: %8lld us\n", name.c_str(), (long long)duration);
+-    }
+-};
+-#endif
+-
+-#if RKNPU_DEBUG
+-#define RKNPU_LOG_INFO(...) fprintf(stderr, __VA_ARGS__)
+-#else
+-#define RKNPU_LOG_INFO(...)
+-#endif
+-
+-#define RKNPU_LOG_ERROR(...) fprintf(stderr, __VA_ARGS__)
+-
+ // Macro for RKNN API calls
+ #define RKNN_CHECK(stmt, msg)                                           \
+     do {                                                                \
+         int ret = (stmt);                                               \
+         if (ret < 0) {                                                  \
+-            RKNPU_LOG_ERROR("RKNN error %d at %s:%d: %s\n", ret,        \
++            fprintf(stderr,"RKNN error %d at %s:%d: %s\n", ret,                \
+                 __FILE__, __LINE__, msg);                               \
+             assert(false);                                              \
+         }                                                               \
+     } while (0)
+ 
+-// --- Constants ---
+-
+-#define NUM_CORES 3
+-
+-// --- Helper functions ---
+-
+-// Packing KxN FP16 (row-major: idx [k,n] -> k*N + n) into native RKNN: (N/16, K/32, 16, 32)
+-static void pack_B_segment_fp16_native_from_KN(
+-    uint16_t * dst, const uint16_t * src,
+-    int K, int N_total, int n_offset, int n_segment) {
+-
+-    GGML_ASSERT(K % 32 == 0 && N_total > 0 && K > 0);
+-    GGML_ASSERT(n_offset % 16 == 0 && n_segment % 16 == 0 && n_offset + n_segment <= N_total);
+-
+-    const size_t s0 = (size_t)(K / 32) * 16 * 32;
+-    const size_t s1 = 16 * 32;
+-    const size_t s2 = 32;
+-
+-    for (int i = 0; i < n_segment / 16; ++i) {
+-        for (int j = 0; j < K / 32; ++j) {
+-            const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
+-            for (int ii = 0; ii < 16; ++ii) {
+-                const size_t n_global = (size_t)n_offset + (size_t)i * 16 + (size_t)ii;
+-                
+-                const uint16_t * src_ptr = src + n_global * K + j * 32;
+-                uint16_t * dst_ptr = dst + dst_block + ii * s2;
+-
+-                uint16x8_t d0 = vld1q_u16(src_ptr + 0);
+-                uint16x8_t d1 = vld1q_u16(src_ptr + 8);
+-                uint16x8_t d2 = vld1q_u16(src_ptr + 16);
+-                uint16x8_t d3 = vld1q_u16(src_ptr + 24);
+-
+-                vst1q_u16(dst_ptr + 0, d0);
+-                vst1q_u16(dst_ptr + 8, d1);
+-                vst1q_u16(dst_ptr + 16, d2);
+-                vst1q_u16(dst_ptr + 24, d3);
+-            }
+-        }
+-    }
+-}
+-
+ // --- Hashers ---
+ 
+ // Function for hash combinations
+@@ -149,13 +83,9 @@ struct MatrixSegment {
+ };
+ 
+ // Split B-matrix into segments
+-static std::vector<MatrixSegment> compute_matrix_segments(int N, int num_cores = 3) {
++static std::vector<MatrixSegment> compute_matrix_segments(int N, int num_cores, int alignment) {
+     std::vector<MatrixSegment> segments;
+-    
+-    // N divisible by 16 for F16
+-    const int alignment = 16;
+-    
+-    // Basic segment size
++
+     int base_segment_size = (N / num_cores / alignment) * alignment;
+     int remaining = N - (base_segment_size * num_cores);
+     
+@@ -181,8 +111,16 @@ static std::vector<MatrixSegment> compute_matrix_segments(int N, int num_cores =
+ 
+ // RKNN buffer context
+ struct ggml_backend_rknpu_buffer_context {
+-    DmaBuffer dma_buf;
++    rknpu2_allocation::DmaBuffer dma_buf;
+     std::string name;
++
++    // Per-tensor scale for weights
++    std::unordered_map<const struct ggml_tensor *, float> quantized_tensor_scales;
++
++    // Per-tensor random sign vector for Hadamard Transform
++    std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
++
++    std::mutex mutex;
+ };
+ 
+ // RKNN matmul operation context
+@@ -201,10 +139,7 @@ struct rknpu_matmul_context {
+         info.AC_layout = RKNN_MM_LAYOUT_NORM;
+ 
+         int ret = rknn_matmul_create(&ctx, &info, &io_attr);
+-        if (ret < 0) {
+-            RKNPU_LOG_ERROR("rknn_matmul_create failed for %dx%dx%d\n", M, K, N);
+-            ctx = 0;
+-        }
++        if (ret < 0) ctx = 0;
+     }
+ 
+     ~rknpu_matmul_context() {
+@@ -221,7 +156,7 @@ struct ggml_backend_rknpu_context {
+     std::mutex mutex;
+ 
+     // RKNN matmul contexts cache
+-    std::unordered_map<std::tuple<int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
++    std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
+ 
+     // B-matrices handle cache (from fd)
+     std::unordered_map<std::pair<ggml_backend_buffer_t, size_t>, std::shared_ptr<rknn_tensor_mem>, PairHasher> b_mem_handle_cache;
+@@ -230,14 +165,14 @@ struct ggml_backend_rknpu_context {
+     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> a_buffer_cache;
+     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
+ 
+-    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id) {
++    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type) {
+         std::lock_guard<std::mutex> lock(mutex);
+-        auto key = std::make_tuple(M, K, N, core_id);
++        auto key = std::make_tuple(M, K, N, core_id, (int)type);
+         auto it = matmul_ctx_cache.find(key);
+         if (it != matmul_ctx_cache.end()) {
+             return it->second;
+         }
+-        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32);
++        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type);
+         if (ctx->ctx == 0) {
+             return nullptr;
+         }
+@@ -252,7 +187,7 @@ struct ggml_backend_rknpu_context {
+ 
+         int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
+         if (ret != RKNN_SUCC) {
+-            RKNPU_LOG_ERROR("Failed to set core mask %d for core %d\n", core_mask, core_id);
++            // Handle error
+         }
+ 
+         matmul_ctx_cache[key] = ctx;
+@@ -275,10 +210,7 @@ struct rknpu_memory_context {
+ 
+         rknn_matmul_io_attr dummy_io_attr;
+         int ret = rknn_matmul_create(&mem_ctx, &dummy_info, &dummy_io_attr);
+-        if (ret < 0) {
+-            RKNPU_LOG_ERROR("Failed to create dummy matmul context for memory operations: %d\n", ret);
+-            mem_ctx = 0;
+-        }
++        if (ret < 0) mem_ctx = 0;
+     }
+ 
+     ~rknpu_memory_context() {
+@@ -346,24 +278,31 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
+ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
+     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
+ 
++    // Getting the current device configuration once
++    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         struct ggml_tensor* node = cgraph->nodes[i];
+         if (node->op != GGML_OP_MUL_MAT) continue;
+ 
+-        #if RKNPU_PERF_LOG
+-        std::string node_name = std::string(node->name) + " (" + std::to_string(i) + ")";
+-        RknpuPerfLogger perf_total(node_name + " - TOTAL");
+-        #endif
+-
+         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
+         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
+         struct ggml_tensor* dst = node;
+ 
++        const ggml_type w_type = src0->type;
++
+         const int M = (int)src1->ne[1];
+         const int K = (int)src0->ne[0];
+         const int N = (int)src0->ne[1];
+ 
+-        auto all_segments = compute_matrix_segments(N, NUM_CORES);
++        const bool is_q4_hadamard = (src0->type == GGML_TYPE_Q4_0);
++        const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
++
++        const auto* op_support = config.find_op_support(src0->type);
++        const rknn_matmul_type matmul_type = op_support->mm_type;
++        const int alignment = op_support->n_align;
++
++        auto all_segments = compute_matrix_segments(N, config.core_count, alignment);
+ 
+         std::vector<MatrixSegment> active_segments;
+         for (const auto& seg : all_segments) {
+@@ -372,10 +311,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+             }
+         }
+ 
+-        if (active_segments.empty()) {
+-            RKNPU_LOG_INFO("Node %s skipped, no active segments for N=%d\n", node->name, N);
+-            continue;
+-        }
++        if (active_segments.empty()) continue;
+ 
+         const size_t num_active_segments = active_segments.size();
+         std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs(num_active_segments);
+@@ -383,34 +319,32 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+         std::shared_ptr<rknn_tensor_mem> mem_A_shared;
+         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments(num_active_segments);
+ 
+-        // ===== 1. Preparing contexts =====
++        // ===========================================
++        // ========== 1. Preparing contexts ==========
++        // ===========================================
+         {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_ctx(node_name + " - Context preparation");
+-            #endif
+             for (size_t i = 0; i < num_active_segments; ++i) {
+                 const auto& seg = active_segments[i];
+-                matmul_ctxs[i] = backend_ctx->get_matmul_ctx(M, K, seg.size_n, seg.core_id);
+-                if (!matmul_ctxs[i] || matmul_ctxs[i]->ctx == 0) {
+-                    RKNPU_LOG_ERROR("Failed to create matmul context for core %d\n", seg.core_id);
+-                    return GGML_STATUS_FAILED;
+-                }
++                matmul_ctxs[i] = backend_ctx->get_matmul_ctx(M, K_op, seg.size_n, seg.core_id, matmul_type);
++                if (!matmul_ctxs[i] || matmul_ctxs[i]->ctx == 0) return GGML_STATUS_FAILED;
+             }
+         }
+ 
+-        // ===== 2. Preparing B-matrix =====
++        // ===========================================
++        // ========== 2. Preparing B-matrix ==========
++        // ===========================================
+         {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_b(node_name + " - B matrix preparation");
+-            #endif
+-
+             ggml_backend_buffer_t src0_buffer = src0->buffer;
+             auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
+             size_t src0_base_offset_in_dma = (uintptr_t)src0->data - (uintptr_t)ggml_backend_buffer_get_base(src0_buffer);
+ 
++            size_t type_size_packed;
++            if (w_type == GGML_TYPE_F16) type_size_packed = 2;
++            else if (w_type == GGML_TYPE_Q8_0) type_size_packed = 1;
++            else type_size_packed = 0;
++
+             size_t current_offset_in_tensor = 0;
+             for (const auto& seg : all_segments) {
+-                bool is_active = false;
+                 for (size_t i = 0; i < num_active_segments; ++i) {
+                     if (active_segments[i].offset_n == seg.offset_n) {
+                         auto& matmul_ctx = matmul_ctxs[i];
+@@ -425,30 +359,26 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+                             mem_B_segments[i] = it->second;
+                         } else {
+                             rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
+-                            if (!mem) {
+-                                RKNPU_LOG_ERROR("rknn_create_mem_from_fd for B segment failed! offset=%zu, size=%zu\n", total_offset, segment_size_bytes);
+-                                return GGML_STATUS_FAILED;
+-                            }
++                            if (!mem) return GGML_STATUS_FAILED;
+                             auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
+                             mem_B_segments[i] = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
+                             backend_ctx->b_mem_handle_cache[cache_key] = mem_B_segments[i];
+                         }
+                         RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B_segments[i].get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+-                        is_active = true;
+                         break;
+                     }
+                 }
+-                current_offset_in_tensor += (size_t)seg.size_n * K * sizeof(uint16_t);
++                current_offset_in_tensor += type_size_packed > 0 ? (size_t)seg.size_n * K_op * type_size_packed : (size_t)seg.size_n * K_op / 2;
+             }
+         }
+ 
+-        // ===== 3. Preparing A-matrix =====
++        // ===========================================
++        // ========== 3. Preparing A-matrix ==========
++        // ===========================================
++        std::vector<float> scales_A(M);
++        float scale_B = 1.0f;
+         {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_a(node_name + " - A matrix preparation");
+-            #endif
+-
+-            auto cache_key = std::make_tuple(M, K, -1);
++            auto cache_key = std::make_tuple(M, K, (int)w_type);
+             auto& matmul_ctx_0 = matmul_ctxs[0];
+ 
+             mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0->ctx, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+@@ -456,21 +386,78 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+ 
+             const float* x = (const float*)src1->data;
+             const int row_stride = (int)(src1->nb[1] / sizeof(float));
+-            uint16_t* dst_base = (uint16_t*)mem_A_shared->virt_addr;
++            void* dst_base = mem_A_shared->virt_addr;
++
++            switch (op_support->npu_type_a) {
++                case rknpu2_configuration::NPU_TYPE_FP16: {
++                    uint16_t* dst_ptr = (uint16_t*)dst_base;
++                    #pragma omp parallel for
++                    for (int m = 0; m < M; ++m) {
++                        const float* src_row = x + (size_t)m * row_stride;
++                        uint16_t* dst_row = dst_ptr + (size_t)m * K;
++                        rknpu2_quantization::convert_fp32_to_fp16(src_row, dst_row, K);
++                    }
++                    break;
++                }
+ 
+-            #pragma omp parallel for
+-            for (int m = 0; m < M; ++m) {
+-                const float* src_row = x + (size_t)m * row_stride;
+-                uint16_t* dst_row = dst_base + (size_t)m * K;
+-                int k = 0;
+-                for (; k <= K - 8; k += 8) {
+-                    float32x4_t f32_vec_0 = vld1q_f32(src_row + k);
+-                    float32x4_t f32_vec_1 = vld1q_f32(src_row + k + 4);
+-                    float16x8_t f16_vec = vcombine_f16(vcvt_f16_f32(f32_vec_0), vcvt_f16_f32(f32_vec_1));
+-                    vst1q_u16(dst_row + k, (uint16x8_t)f16_vec);
++                case rknpu2_configuration::NPU_TYPE_INT8: {
++                    int8_t* dst_ptr = (int8_t*)dst_base;
++                    #pragma omp parallel for
++                    for (int m = 0; m < M; ++m) {
++                        const float* src_row = x + (size_t)m * row_stride;
++                        float amax_m = 0.0f;
++                        for (int k = 0; k < K; ++k) {
++                            amax_m = std::max(amax_m, std::abs(src_row[k]));
++                        }
++                        scales_A[m] = amax_m / 127.0f;
++                        int8_t* dst_row = dst_ptr + (size_t)m * K;
++                        rknpu2_quantization::quantize_fp32_to_int8(src_row, dst_row, K, scales_A[m]);
++                    }
++                    break;
++                }
++
++                case rknpu2_configuration::NPU_TYPE_INT4: {
++                    auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0->buffer->context;
++                    std::vector<float> s_vec;
++                    {
++                        std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
++                        auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
++                        GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
++                        s_vec = it->second;
++                    }
++
++                    uint8_t* dst_ptr = (uint8_t*)dst_base;
++                    #pragma omp parallel for
++                    for (int m = 0; m < M; ++m) {
++                        const float* src_row = x + (size_t)m * row_stride;
++                        std::vector<float> signed_row(K);
++                        for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
++
++                        std::vector<float> rotated_row(K_op);
++                        rknpu2_calibration::hadamard_transform(rotated_row.data(), signed_row.data(), K, K_op);
++
++                        float amax_m = 0.0f;
++                        for (int k = 0; k < K_op; ++k) amax_m = std::max(amax_m, std::abs(rotated_row[k]));
++                        scales_A[m] = amax_m / 7.0f;
++                        uint8_t* dst_row = dst_ptr + (size_t)m * (K_op / 2);
++                        rknpu2_quantization::quantize_fp32_to_int4_packed(rotated_row.data(), dst_row, K_op, scales_A[m]);
++                    }
++                    break;
+                 }
+-                for (; k < K; ++k) {
+-                    dst_row[k] = GGML_FP32_TO_FP16(src_row[k]);
++
++                default:
++                    // This should not be reached if config is correct
++                    return GGML_STATUS_FAILED;
++            }
++
++            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 || op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
++                ggml_backend_buffer_t src0_buffer = src0->buffer;
++                auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
++                {
++                    std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
++                    auto it = src0_buf_ctx->quantized_tensor_scales.find(src0);
++                    GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scale not found");
++                    scale_B = it->second;
+                 }
+             }
+ 
+@@ -481,12 +468,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+             }
+         }
+ 
+-        // ===== 4. Preparing C-matrix =====
+-        {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_c(node_name + " - C matrix preparation");
+-            #endif
+-            
++        // ===========================================
++        // ========== 4. Preparing C-matrix ==========
++        // ===========================================
++        {            
+             for (size_t i = 0; i < num_active_segments; i++) {
+                 auto& matmul_ctx = matmul_ctxs[i];
+                 auto cache_key = std::make_tuple(M, active_segments[i].size_n, active_segments[i].core_id);
+@@ -496,27 +481,23 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+             }
+         }
+ 
+-        // ===== 5. Running operation =====
+-        {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_run(node_name + " - NPU parallel execution");
+-            #endif
+-            
++        // ==========================================
++        // ========== 5. Running operation ==========
++        // ==========================================
++        {            
+             #pragma omp parallel for num_threads(num_active_segments)
+             for (size_t i = 0; i < num_active_segments; i++) {
+                 int ret = rknn_matmul_run(matmul_ctxs[i]->ctx);
+                 if (ret != RKNN_SUCC) {
+-                    RKNPU_LOG_ERROR("rknn_matmul_run failed for core %d with error %d\n", active_segments[i].core_id, ret);
++                    // Handle error
+                 }
+             }
+         }
+ 
+-        // ===== 6. Collecting results =====
++        // ===========================================
++        // ========== 6. Collecting results ==========
++        // ===========================================
+         {
+-            #if RKNPU_PERF_LOG
+-            RknpuPerfLogger perf_gather(node_name + " - Result gathering");
+-            #endif
+-
+             float* dst_data = (float*)dst->data;
+             
+             for (size_t i = 0; i < num_active_segments; i++) {
+@@ -525,14 +506,52 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+ 
+             #pragma omp parallel for
+             for (int m = 0; m < M; m++) {
+-                for (size_t i = 0; i < num_active_segments; i++) {
+-                    int N_offset = active_segments[i].offset_n;
+-                    int N_segment = active_segments[i].size_n;
+-                    float* src_segment_base = (float*)mem_C_segments[i]->virt_addr;
+-
+-                    memcpy(dst_data + (size_t)m * N + N_offset,
+-                           src_segment_base + (size_t)m * N_segment,
+-                           N_segment * sizeof(float));
++                switch (op_support->npu_type_c) {
++                    case rknpu2_configuration::NPU_TYPE_FP32: {
++                        for (size_t i = 0; i < num_active_segments; i++) {
++                            int N_offset = active_segments[i].offset_n;
++                            int N_segment = active_segments[i].size_n;
++                            float* src_segment_base = (float*)mem_C_segments[i]->virt_addr;
++                            memcpy(dst_data + (size_t)m * N + N_offset,
++                                src_segment_base + (size_t)m * N_segment,
++                                N_segment * sizeof(float));
++                        }
++                        break;
++                    }
++
++                    case rknpu2_configuration::NPU_TYPE_INT32: {
++                        float dequant_scale = scales_A[m] * scale_B;
++                        for (size_t i = 0; i < num_active_segments; i++) {
++                            int N_offset = active_segments[i].offset_n;
++                            int N_segment = active_segments[i].size_n;
++                            float* dst_ptr = dst_data + (size_t)m * N + N_offset;
++                            int32_t* src_segment_base = (int32_t*)mem_C_segments[i]->virt_addr;
++                            int32_t* src_ptr = src_segment_base + (size_t)m * N_segment;
++                            rknpu2_quantization::dequantize_int32_to_fp32(src_ptr, dst_ptr, N_segment, dequant_scale);
++                        }
++                        break;
++                    }
++
++                    case rknpu2_configuration::NPU_TYPE_INT16: {
++                        float dequant_scale = scales_A[m] * scale_B;
++                        if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
++                            dequant_scale /= (float)K_op;
++                        }
++
++                        for (size_t i = 0; i < num_active_segments; i++) {
++                            int N_offset = active_segments[i].offset_n;
++                            int N_segment = active_segments[i].size_n;
++                            float* dst_ptr = dst_data + (size_t)m * N + N_offset;
++                            int16_t* src_segment_base = (int16_t*)mem_C_segments[i]->virt_addr;
++                            int16_t* src_ptr = src_segment_base + (size_t)m * N_segment;
++                            rknpu2_quantization::dequantize_int16_to_fp32(src_ptr, dst_ptr, N_segment, dequant_scale);
++                        }
++                        break;
++                    }
++                    
++                    default:
++                        // This should not be reached if config is correct
++                        break;
+                 }
+             }
+         }
+@@ -548,7 +567,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+ 
+ static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+-    dma_free(ctx->dma_buf);
++    rknpu2_allocation::free(ctx->dma_buf);
+     delete ctx;
+ }
+ 
+@@ -568,30 +587,224 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
+     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
+     uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_buffer_get_base(buffer));
+ 
+-    // Weights
+-    if (tensor->type == GGML_TYPE_F16) {
++    // Getting the current device configuration to drive the packing logic
++    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
++    const auto* op_support = config.find_op_support(tensor->type);
++
++    // If there is a specific packing function defined for this tensor type, it's a weight matrix
++    if (op_support && op_support->pack_func) {
+         const int K = (int)tensor->ne[0];
+         const int N = (int)tensor->ne[1];
+-        auto segments = compute_matrix_segments(N, NUM_CORES);
+ 
+-        uint8_t* current_write_ptr = tensor_dma_ptr;
+-        const uint16_t* src_data = (const uint16_t*)data;
++        if (tensor->type == GGML_TYPE_F16) {
++            auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
++
++            uint8_t* current_write_ptr = tensor_dma_ptr;
++            std::vector<uint8_t> packed_data_temp;
+ 
+-        std::vector<uint16_t> packed_data_temp;
++            for (const auto& seg : segments) {
++                if (seg.size_n == 0) continue;
++                size_t segment_packed_size_bytes = (size_t)seg.size_n * K * sizeof(uint16_t);
++                packed_data_temp.resize(segment_packed_size_bytes);
++
++                op_support->pack_func(
++                    packed_data_temp.data(),
++                    (const uint8_t*)data,
++                    K, N, seg.offset_n, seg.size_n
++                );
++                memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size_bytes);
++                current_write_ptr += segment_packed_size_bytes;
++            }
++        // GGML_TYPE_Q8_0
++        } else if (tensor->type == GGML_TYPE_Q8_0) {
++            const block_q8_0* src_blocks = (const block_q8_0*)data;
++            const size_t n_elements = (size_t)K * N;
++
++            // Finding the global scale without storing the full dequantized matrix.
++            float amax = 0.0f;
++            #pragma omp parallel
++            {
++                std::vector<float> tmp_row(K);
++                #pragma omp for reduction(max:amax)
++                for (int n = 0; n < N; ++n) {
++                    dequantize_row_q8_0(src_blocks + (size_t)n * (K / QK8_0), tmp_row.data(), K);
++                    for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
++                }
++            }
+ 
+-        for (const auto& seg : segments) {
+-            size_t segment_packed_size = (size_t)seg.size_n * K * sizeof(uint16_t);
+-            packed_data_temp.resize(segment_packed_size / sizeof(uint16_t));
++            const float global_scale_b = amax / 127.0f;
+ 
+-            pack_B_segment_fp16_native_from_KN(
+-                packed_data_temp.data(),
+-                src_data,
+-                K, N, seg.offset_n, seg.size_n
+-            );
+-            memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
+-            current_write_ptr += segment_packed_size;
++            // Storing it in the buffer context cache
++            {
++                std::lock_guard<std::mutex> lock(ctx->mutex);
++                ctx->quantized_tensor_scales[tensor] = global_scale_b;
++            }
++
++            // Dequantizing and re-quantizing directly row-by-row
++            std::vector<int8_t> requantized_data(n_elements);
++            #pragma omp parallel
++            {
++                std::vector<float> tmp_row(K);
++                #pragma omp for
++                for (int n = 0; n < N; ++n) {
++                    dequantize_row_q8_0(src_blocks + (size_t)n * (K / QK8_0), tmp_row.data(), K);
++                    rknpu2_quantization::quantize_fp32_to_int8(tmp_row.data(), requantized_data.data() + (size_t)n * K, K, global_scale_b);
++                }
++            }
++
++            // Packing into native format by segments
++            auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
++            uint8_t* current_write_ptr = tensor_dma_ptr;
++            std::vector<uint8_t> packed_data_temp;
++
++            for (const auto& seg : segments) {
++                if (seg.size_n == 0) continue;
++                size_t segment_packed_size = (size_t)seg.size_n * K;
++                packed_data_temp.resize(segment_packed_size);
++
++                op_support->pack_func(
++                    packed_data_temp.data(),
++                    (const uint8_t*)requantized_data.data(),
++                    K, N, seg.offset_n, seg.size_n
++                );
++                memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
++                current_write_ptr += segment_packed_size;
++            }
++        // GGML_TYPE_Q4_0
++        } else if (tensor->type == GGML_TYPE_Q4_0) {
++            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
++                const block_q4_0* src_blocks = (const block_q4_0*)data;
++
++                // Dequantizing original weights to FP32
++                const size_t n_elements_original = (size_t)K * N;
++                std::vector<float> dequantized_data(n_elements_original);
++                #pragma omp parallel for
++                for (int n = 0; n < N; ++n) {
++                    dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), dequantized_data.data() + (size_t)n * K, K);
++                }
++
++                // Padding K and generating the random sign vector 's'
++                const int padded_K = rknpu2_calibration::next_power_of_two(K);
++                std::vector<float> s_vec(padded_K);
++                std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor));
++                std::uniform_int_distribution<int> distrib(0, 1);
++                for(int k = 0; k < padded_K; ++k) {
++                    s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
++                }
++
++                // Storing the vector for use during activation processing
++                {
++                    std::lock_guard<std::mutex> lock(ctx->mutex);
++                    ctx->hadamard_s_vectors[tensor] = s_vec;
++                }
++
++                // Rotating the FP32 weight matrix using padding
++                const size_t n_elements_padded = (size_t)N * padded_K;
++                std::vector<float> rotated_b_fp32(n_elements_padded);
++                #pragma omp parallel for
++                for (int n = 0; n < N; ++n) {
++                    const float* src_row = dequantized_data.data() + (size_t)n * K;
++                    float* dst_row_rot = rotated_b_fp32.data() + (size_t)n * padded_K;
++                    
++                    std::vector<float> signed_row(K);
++                    for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
++
++                    rknpu2_calibration::hadamard_transform(dst_row_rot, signed_row.data(), K, padded_K);
++                }
++
++                // Finding scale on the rotated data
++                const float amax = rknpu2_calibration::calculate_entropy_amax(rotated_b_fp32.data(), n_elements_padded);
++                const float global_scale_b = amax / 7.0f;
++
++                {
++                    std::lock_guard<std::mutex> lock(ctx->mutex);
++                    ctx->quantized_tensor_scales[tensor] = global_scale_b;
++                }
++
++                // Quantizing data to INT4
++                std::vector<uint8_t> packed_int4_data(n_elements_padded / 2);
++                #pragma omp parallel for
++                for (int n = 0; n < N; ++n) {
++                    rknpu2_quantization::quantize_fp32_to_int4_packed(
++                        rotated_b_fp32.data() + (size_t)n * padded_K,
++                        packed_int4_data.data() + (size_t)n * (padded_K/2),
++                        padded_K, global_scale_b
++                    );
++                }
++
++                // Packing into native RKNN format with padded_K
++                uint8_t* current_write_ptr = tensor_dma_ptr;
++                std::vector<uint8_t> packed_data_temp;
++
++                for (const auto& seg : compute_matrix_segments(N, config.core_count, op_support->n_align)) {
++                    if (seg.size_n == 0) continue;
++                    size_t segment_packed_size = (size_t)seg.size_n * padded_K / 2;
++                    packed_data_temp.resize(segment_packed_size);
++
++                    op_support->pack_func(
++                        packed_data_temp.data(),
++                        packed_int4_data.data(),
++                        padded_K, N, seg.offset_n, seg.size_n
++                    );
++                    memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
++                    current_write_ptr += segment_packed_size;
++                }
++            } else {
++                const block_q4_0* src_blocks = (const block_q4_0*)data;
++                const size_t n_elements = (size_t)K * N;
++
++                // Finding the global scale without storing the full dequantized matrix.
++                float amax = 0.0f;
++                #pragma omp parallel
++                {
++                    std::vector<float> tmp_row(K);
++                    #pragma omp for reduction(max:amax)
++                    for (int n = 0; n < N; ++n) {
++                        dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), tmp_row.data(), K);
++                        for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
++                    }
++                }
++
++                const float global_scale_b = amax / 7.0f;
++
++                // Storing it in the buffer context cache
++                {
++                    std::lock_guard<std::mutex> lock(ctx->mutex);
++                    ctx->quantized_tensor_scales[tensor] = global_scale_b;
++                }
++
++                // Dequantizing and re-quantizing directly row-by-row
++                std::vector<uint8_t> requantized_data(n_elements / 2);
++                #pragma omp parallel
++                {
++                    std::vector<float> tmp_row(K);
++                    #pragma omp for
++                    for (int n = 0; n < N; ++n) {
++                        dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), tmp_row.data(), K);
++                        rknpu2_quantization::quantize_fp32_to_int4_packed(tmp_row.data(), requantized_data.data() + (size_t)n * (K/2), K, global_scale_b);
++                    }
++                }
++
++                // Packing into native format by segments
++                auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
++                uint8_t* current_write_ptr = tensor_dma_ptr;
++                std::vector<uint8_t> packed_data_temp;
++
++                for (const auto& seg : segments) {
++                    if (seg.size_n == 0) continue;
++                    size_t segment_packed_size = (size_t)seg.size_n * K / 2;
++                    packed_data_temp.resize(segment_packed_size);
++
++                    op_support->pack_func(
++                        packed_data_temp.data(), requantized_data.data(),
++                        K, N, seg.offset_n, seg.size_n
++                    );
++                    memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
++                    current_write_ptr += segment_packed_size;
++                }
++            }
+         }
+-    // Other types
++    // Other tensor types
+     } else {
+         memcpy(tensor_dma_ptr + offset, data, size);
+     }
+@@ -622,13 +835,14 @@ static const char * ggml_backend_rknpu_buffer_type_get_name(ggml_backend_buffer_
+ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+     UNUSED(buft);
+ 
+-    DmaBuffer dma_buf = dma_alloc(size);
++    rknpu2_allocation::DmaBuffer dma_buf = rknpu2_allocation::alloc(size);
+     if (dma_buf.fd < 0) {
+-        RKNPU_LOG_ERROR("dma_alloc failed to allocate %zu bytes\n", size);
+         return NULL;
+     }
+ 
+-    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context{dma_buf, "rknpu_dma_buffer"};
++    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context{
++        dma_buf, "rknpu_dma_buffer", {}, {}, {}
++    };
+ 
+     static const ggml_backend_buffer_i rknpu_buffer_interface = {
+         /* .free_buffer   = */ ggml_backend_rknpu_buffer_free_buffer,
+@@ -652,6 +866,31 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
+ 
+ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+     UNUSED(buft);
++
++    // Getting the current device configuration
++    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
++    const auto* op_support = config.find_op_support(tensor->type);
++
++    // Padding Q4_0 weights to the next power of two for Hadamard Transform.
++    if (tensor->type == GGML_TYPE_Q4_0) {
++        if (op_support && op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
++            const int K = (int)tensor->ne[0];
++            const int N = (int)tensor->ne[1];
++
++            const int padded_K = rknpu2_calibration::next_power_of_two(K);
++
++            auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
++            size_t total_size = 0;
++            for (const auto& seg : segments) {
++                if (seg.size_n > 0) {
++                    total_size += (size_t)seg.size_n * padded_K / 2;
++                }
++            }
++            return total_size;
++        }
++    }
++
++    // Fallback to default size calculation for other types.
+     return ggml_nbytes(tensor);
+ }
+ 
+@@ -696,49 +935,52 @@ static void ggml_backend_rknpu_device_get_props(ggml_backend_dev_t dev, struct g
+ 
+ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     UNUSED(dev);
+-    RKNPU_LOG_INFO("[RKNPU_SUPPORT] Checking support for op: %s, name: %s\n", ggml_op_name(op->op), op->name);
++
++    // Getting the current device configuration
++    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+ 
+     switch (op->op) {
+         case GGML_OP_NONE:
+-            RKNPU_LOG_INFO("  - ACCEPT: Op NONE is supported for RKNPU (leaf/weights).\n");
+             return true;
+ 
+         case GGML_OP_MUL_MAT: {
+             const struct ggml_tensor * src0 = op->src[0]; // Weights
+             const struct ggml_tensor * src1 = op->src[1]; // Activations
+ 
+-            RKNPU_LOG_INFO("  - src0: type=%s, dims=[%lld, %lld, %lld, %lld]\n", ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+-            RKNPU_LOG_INFO("  - src1: type=%s, dims=[%lld, %lld, %lld, %lld]\n", ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
++            // Finding if there is a supported operation for the given weight type
++            const auto* op_support = config.find_op_support(src0->type);
++            if (!op_support) {
++                return false;
++            }
++
++            // Checking if activation type matches the supported operation
++            if (src1->type != op_support->type_a) {
++                return false;
++            }
+ 
+-            // Checking for weights in F16 and activations in F32
+-            if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32) {
+-                RKNPU_LOG_INFO("  - REJECT: Unsupported type combination. Want src0=F16, src1=F32.\n");
++            // Checking for K alignment
++            if (src0->ne[0] % op_support->k_align != 0) {
+                 return false;
+             }
+ 
+-            // Checking for K divisible 32, N divisible 16
+-            if (src0->ne[0] % 32 != 0 || src0->ne[1] % 16 != 0) {
+-                RKNPU_LOG_INFO("  - REJECT: K (%lld) must be a multiple of 32 and N (%lld) a multiple of 16.\n", src0->ne[0], src0->ne[1]);
++            // Checking for N alignment
++            if (src0->ne[1] % op_support->n_align != 0) {
+                 return false;
+             }
+ 
+-            // Checking for exact dimentions
++            // Checking for exact dimensions
+             if (src1->ne[0] != src0->ne[0]) {
+-                 RKNPU_LOG_INFO("  - REJECT: K dimensions do not match (%lld vs %lld).\n", src1->ne[0], src0->ne[0]);
+                  return false;
+             }
+ 
+             // Checking contiguous memory
+             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+-                RKNPU_LOG_INFO("  - REJECT: Tensors are not contiguous.\n");
+                 return false;
+             }
+ 
+-            RKNPU_LOG_INFO("  - ACCEPT: Op %s can be offloaded to RKNPU.\n", op->name);
+             return true;
+         }
+         default:
+-            RKNPU_LOG_INFO("  - REJECT: Op %s is not supported by RKNPU backend.\n", ggml_op_name(op->op));
+             return false;
+     }
+ }
+@@ -747,7 +989,10 @@ static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t
+     UNUSED(dev);
+     UNUSED(params);
+ 
+-    ggml_backend_rknpu_context * ctx = new ggml_backend_rknpu_context{"RKNPU Backend"};
++    // TODO: Make device selection dynamic (e.g., from params or env var)
++    if (!rknpu2_configuration::Rknpu2ConfigManager::get_instance().select_device("RK3588")) return NULL;
++
++    ggml_backend_rknpu_context * ctx = new ggml_backend_rknpu_context();
+     
+     static const struct ggml_backend_i rknpu_backend_interface = {
+         /* .get_name           = */ ggml_backend_rknpu_name,
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-allocation.cpp b/ggml/src/ggml-rknpu2/rknpu2-allocation.cpp
+new file mode 100644
+index 000000000..e2f636b8f
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-allocation.cpp
+@@ -0,0 +1,77 @@
++#include "rknpu2-allocation.h"
++
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <string.h>
++#include <cerrno>
++#include <cstdio>
++
++// --- Anonymous namespace for implementation details ---
++
++namespace {
++
++// --- DMA-Heap specific structures and IOCTL commands ---
++
++struct dma_heap_allocation_data {
++    uint64_t len;
++    uint32_t fd;
++    uint32_t fd_flags;
++    uint64_t heap_flags;
++};
++
++#define DMA_HEAP_IOC_MAGIC 'H'
++#define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
++
++} // anonymous namespace
++
++namespace rknpu2_allocation {
++
++DmaBuffer alloc(size_t size) {
++    DmaBuffer buffer;
++    buffer.size = size;
++
++    const char* path = "/dev/dma_heap/system";
++    int dma_heap_fd = open(path, O_RDWR);
++    if (dma_heap_fd < 0) {
++        fprintf(stderr, "RKNPU_DMA_ALLOC: Failed to open %s: %s\n", path, strerror(errno));
++        return buffer;
++    }
++
++    dma_heap_allocation_data buf_data;
++    memset(&buf_data, 0, sizeof(buf_data));
++    buf_data.len = size;
++    buf_data.fd_flags = O_CLOEXEC | O_RDWR;
++
++    if (ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data) < 0) {
++        fprintf(stderr, "RKNPU_DMA_ALLOC: ioctl DMA_HEAP_IOCTL_ALLOC failed: %s\n", strerror(errno));
++        close(dma_heap_fd);
++        return buffer;
++    }
++
++    close(dma_heap_fd);
++
++    buffer.fd = buf_data.fd;
++    buffer.virt_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
++
++    if (buffer.virt_addr == MAP_FAILED) {
++        fprintf(stderr, "RKNPU_DMA_ALLOC: mmap failed: %s\n", strerror(errno));
++        close(buffer.fd);
++        buffer.fd = -1;
++        buffer.virt_addr = nullptr;
++    }
++
++    return buffer;
++}
++
++void free(const DmaBuffer& buffer) {
++    if (buffer.virt_addr != nullptr) {
++        munmap(buffer.virt_addr, buffer.size);
++    }
++    if (buffer.fd >= 0) {
++        close(buffer.fd);
++    }
++}
++
++} // namespace rknpu2_allocation
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-allocation.h b/ggml/src/ggml-rknpu2/rknpu2-allocation.h
+new file mode 100644
+index 000000000..a216ae062
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-allocation.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++/**
++ * @brief Provides a simple interface for allocating and freeing physically contiguous
++ * memory using the Linux DMA-Heap subsystem, which is required for zero-copy
++ * operations with the Rockchip NPU.
++ */
++namespace rknpu2_allocation {
++
++/**
++ * @brief Represents a block of memory allocated from the DMA-Heap.
++ *
++ * This struct holds the file descriptor, virtual address, and size of the
++ * allocated buffer. It is the handle used for all operations.
++ */
++struct DmaBuffer {
++    int fd = -1;                // File descriptor for the DMA buffer
++    void* virt_addr = nullptr;  // User-space virtual address mapped to the buffer
++    size_t size = 0;            // Size of the allocation in bytes
++};
++
++/**
++ * @brief Allocates a physically contiguous block of memory from the system DMA heap.
++ *
++ * @param size The number of bytes to allocate.
++ * @return A DmaBuffer struct. If allocation fails, `fd` will be -1 and
++ *         `virt_addr` will be nullptr.
++ */
++DmaBuffer alloc(size_t size);
++
++/**
++ * @brief Frees a previously allocated DMA buffer.
++ *
++ * This function unmaps the virtual address and closes the file descriptor.
++ *
++ * @param buffer The DmaBuffer to be freed.
++ */
++void free(const DmaBuffer& buffer);
++
++} // namespace rknpu2_allocation
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-calibration.cpp b/ggml/src/ggml-rknpu2/rknpu2-calibration.cpp
+new file mode 100644
+index 000000000..690e72ec0
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-calibration.cpp
+@@ -0,0 +1,243 @@
++#include "rknpu2-calibration.h"
++
++#include <vector>
++#include <cmath>
++#include <algorithm>
++#include <limits>
++#include <cstring>
++#include <omp.h>
++
++namespace rknpu2_calibration {
++
++// --- Calibration Implementations ---
++
++float calculate_percentile_amax(const float * data, size_t n_elements, float percentile) {
++    if (n_elements == 0) {
++        return 0.0f;
++    }
++
++    // Creating a vector of absolute values. We need a mutable copy to use nth_element.
++    std::vector<float> abs_values(n_elements);
++    #pragma omp parallel for
++    for (size_t i = 0; i < n_elements; ++i) {
++        abs_values[i] = std::abs(data[i]);
++    }
++
++    // Finding the index corresponding to the percentile
++    size_t index = static_cast<size_t>((float)n_elements * percentile / 100.0f);
++
++    // Clamping the index to be within the valid range
++    index = std::min(index, n_elements - 1);
++
++    // Useing std::nth_element to find the k-th smallest element without a full sort.
++    std::nth_element(abs_values.begin(), abs_values.begin() + index, abs_values.end());
++
++    return abs_values[index];
++}
++
++float calculate_min_mse_amax(const float * data, size_t n_elements, int num_steps) {
++    if (n_elements == 0) {
++        return 0.0f;
++    }
++
++    // Determining search range for amax
++    float abs_max_val = 0.0f;
++    for (size_t i = 0; i < n_elements; ++i) {
++        abs_max_val = std::max(abs_max_val, std::abs(data[i]));
++    }
++    if (abs_max_val == 0.0f) {
++        return 0.0f;
++    }
++    // Using a high percentile as the lower bound to narrow the search range
++    float percentile_max_val = calculate_percentile_amax(data, n_elements, 99.9f);
++
++    float search_min = percentile_max_val;
++    float search_max = abs_max_val;
++
++    if (search_min >= search_max) {
++        return search_max;
++    }
++
++    // Iteratively searching for the best amax
++    float best_amax = search_max;
++    double min_mse = std::numeric_limits<double>::max();
++    const float step_size = (search_max - search_min) / num_steps;
++
++    for (int i = 0; i < num_steps; ++i) {
++        const float current_amax = search_min + (float)i * step_size;
++        const float current_scale = current_amax / 7.0f;
++        if (current_scale < 1e-9f) continue;
++        const float iscale = 1.0f / current_scale;
++
++        // Calculating MSE for the current amax candidate
++        double current_mse = 0.0;
++        #pragma omp parallel for reduction(+:current_mse)
++        for (size_t j = 0; j < n_elements; ++j) {
++            const float original_val = data[j];
++            
++            // Quantizing
++            const float quantized_f = original_val * iscale;
++            const int8_t quantized_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(quantized_f)));
++            
++            // De-quantizing
++            const float dequantized_val = (float)quantized_i * current_scale;
++            
++            // Accumulating error
++            const double diff = (double)original_val - (double)dequantized_val;
++            current_mse += diff * diff;
++        }
++
++        if (current_mse < min_mse) {
++            min_mse = current_mse;
++            best_amax = current_amax;
++        }
++    }
++    return best_amax;
++}
++
++float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins, int num_steps) {
++    if (n_elements == 0) {
++        return 0.0f;
++    }
++
++    // Defining search range and creating reference distribution P
++    float abs_max_val = 0.0f;
++    for (size_t i = 0; i < n_elements; ++i) {
++        abs_max_val = std::max(abs_max_val, std::abs(data[i]));
++    }
++    if (abs_max_val == 0.0f) {
++        return 0.0f;
++    }
++
++    std::vector<double> p_dist(num_bins, 0.0);
++    const double bin_width = (double)abs_max_val * 2.0 / num_bins;
++    for (size_t i = 0; i < n_elements; ++i) {
++        int bin_index = static_cast<int>(((data[i] + abs_max_val) / bin_width));
++        bin_index = std::min(num_bins - 1, bin_index);
++        p_dist[bin_index]++;
++    }
++
++    // Normalizing histogram to a probability distribution, adding epsilon for stability
++    const double epsilon = 1e-9;
++    for (int i = 0; i < num_bins; ++i) {
++        p_dist[i] = (p_dist[i] / n_elements) + epsilon;
++    }
++
++    // Iteratively searching for the best amax by minimizing KL-divergence
++    float best_amax = abs_max_val;
++    double min_kl_div = std::numeric_limits<double>::max();
++    
++    // Narrowing the search range to avoid wasting time on obviously bad values
++    const float search_min = calculate_percentile_amax(data, n_elements, 99.5f);
++    const float search_max = abs_max_val;
++    const float step_size = (search_max - search_min) / num_steps;
++
++    for (int i = 0; i < num_steps; ++i) {
++        const float current_amax = search_min + (float)i * step_size;
++        const float current_scale = current_amax / 7.0f;
++        if (current_scale < 1e-9f) continue;
++        const float iscale = 1.0f / current_scale;
++
++        // Creating quantized distribution Q based on P
++        std::vector<double> q_dist(num_bins, 0.0);
++        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
++            const float original_val = -abs_max_val + (bin_idx + 0.5f) * bin_width;
++
++            // Quantizing-dequantizing the value from the center of the bin
++            const float quantized_f = original_val * iscale;
++            const int8_t quantized_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(quantized_f)));
++            const float dequantized_val = (float)quantized_i * current_scale;
++
++            // Finding which bin the de-quantized value falls into
++            int new_bin_idx = static_cast<int>(((dequantized_val + abs_max_val) / bin_width));
++            new_bin_idx = std::max(0, std::min(num_bins - 1, new_bin_idx));
++
++            // Transfering the "probability mass" from the old bin to the new one
++            q_dist[new_bin_idx] += p_dist[bin_idx];
++        }
++
++        // Normalizing Q
++        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
++            q_dist[bin_idx] += epsilon;
++        }
++
++        // Calculating KL-divergence
++        double current_kl_div = 0.0;
++        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
++            if (p_dist[bin_idx] > epsilon * 1.1) {
++                current_kl_div += p_dist[bin_idx] * log(p_dist[bin_idx] / q_dist[bin_idx]);
++            }
++        }
++
++        if (current_kl_div < min_kl_div) {
++            min_kl_div = current_kl_div;
++            best_amax = current_amax;
++        }
++    }
++    return best_amax;
++}
++
++
++// --- Hadamard Transform Implementations ---
++
++// Helper to check if a number is a power of two
++static bool is_power_of_two(int n) {
++    return (n > 0) && ((n & (n - 1)) == 0);
++}
++
++// Iterative Fast Walsh-Hadamard Transform (in-place)
++static void fwht_iterative(float* data, int size) {
++    for (int h = 1; h < size; h <<= 1) {
++        for (int i = 0; i < size; i += h * 2) {
++            for (int j = i; j < i + h; ++j) {
++                float x = data[j];
++                float y = data[j + h];
++                data[j] = x + y;
++                data[j + h] = x - y;
++            }
++        }
++    }
++}
++
++int next_power_of_two(int n) {
++    if (n == 0) return 1;
++    n--;
++    n |= n >> 1;
++    n |= n >> 2;
++    n |= n >> 4;
++    n |= n >> 8;
++    n |= n >> 16;
++    n++;
++    return n;
++}
++
++void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
++    // If no padding is needed, copy and perform in-place.
++    if (K == padded_size) {
++        memcpy(dst, src, K * sizeof(float));
++        fwht_iterative(dst, K);
++        return;
++    }
++
++    // Using a thread-local buffer to avoid repeated heap allocations.
++    thread_local static std::vector<float> padded_data;
++    
++    // Resizing the buffer only if the current one is too small.
++    if (padded_data.size() < (size_t)padded_size) {
++        padded_data.resize(padded_size);
++    }
++    
++    // Copying source data and zero-fill the rest (padding).
++    memcpy(padded_data.data(), src, K * sizeof(float));
++    if (padded_size > K) {
++        memset(padded_data.data() + K, 0, (padded_size - K) * sizeof(float));
++    }
++
++    // Applying the transform to our temporary buffer
++    fwht_iterative(padded_data.data(), padded_size);
++
++    // Copying the result to the destination buffer
++    memcpy(dst, padded_data.data(), padded_size * sizeof(float));
++}
++
++} // namespace rknpu2_calibration
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-calibration.h b/ggml/src/ggml-rknpu2/rknpu2-calibration.h
+new file mode 100644
+index 000000000..3a32f5434
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-calibration.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include <vector>
++#include <cstddef>
++
++/**
++ * @brief Provides algorithms for tensor calibration and transformation.
++ *
++ * This namespace contains functions for finding optimal quantization parameters (amax)
++ * using various statistical methods, as well as mathematical transformations like
++ * the Hadamard transform used in advanced quantization schemes.
++ */
++namespace rknpu2_calibration {
++
++// --- Calibration Implementations ---
++
++/**
++ * @brief Finds the absolute maximum value based on a given percentile.
++ * @param data Pointer to the source float data.
++ * @param n_elements The number of elements in the data array.
++ * @param percentile The percentile to calculate (e.g., 99.9f).
++ * @return The absolute value at the specified percentile.
++ */
++float calculate_percentile_amax(const float * data, size_t n_elements, float percentile);
++
++/**
++ * @brief Finds the optimal amax by iteratively minimizing Mean Squared Error (MSE).
++ * @param data Pointer to the source float data.
++ * @param n_elements The number of elements in the data array.
++ * @param num_steps The number of steps to iterate through in the search space.
++ * @return The amax value that results in the lowest quantization error.
++ */
++float calculate_min_mse_amax(const float * data, size_t n_elements, int num_steps = 128);
++
++/**
++ * @brief Finds the optimal amax by minimizing KL-Divergence between FP32 and INT4 distributions.
++ * @param data Pointer to the source float data.
++ * @param n_elements The number of elements in the data array.
++ * @param num_bins The number of bins for the histogram distributions.
++ * @param num_steps The number of steps to iterate through in the search space.
++ * @return The amax value that minimizes the information loss.
++ */
++float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins = 2048, int num_steps = 128);
++
++
++// --- Hadamard Transform Implementations ---
++
++/**
++ * @brief Applies a Fast Walsh-Hadamard Transform.
++ *
++ * This version is optimized for scenarios where padding is always expected. It takes separate
++ * source and destination buffers and avoids extra allocations by using a thread-local buffer.
++ *
++ * @param dst Pointer to the destination buffer. Must be of size `padded_size`.
++ * @param src Pointer to the source data buffer of size `K`.
++ * @param K The original number of elements in the source data.
++ * @param padded_size The target size for the transform (must be a power of two >= K). The full result is written to dst.
++ */
++void hadamard_transform(float* dst, const float* src, int K, int padded_size);
++
++/**
++ * @brief Calculates the next power of two for a given integer.
++ * @param n The input integer.
++ * @return The smallest power of two that is greater than or equal to n.
++ */
++int next_power_of_two(int n);
++
++} // namespace rknpu2_calibration
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-configuration.cpp b/ggml/src/ggml-rknpu2/rknpu2-configuration.cpp
+new file mode 100644
+index 000000000..25a0dc4d2
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-configuration.cpp
+@@ -0,0 +1,192 @@
++#include "ggml-impl.h"
++
++#include "rknpu2-configuration.h"
++
++#include <arm_neon.h>
++
++// --- Anonymous namespace for chip-specific packing functions ---
++
++namespace {
++
++// Packing KxN FP16 (row-major: idx [k,n] -> k*N + n) into native RKNN for RK3588: (N/16, K/32, 16, 32)
++void pack_B_rk3588_fp16(
++    uint8_t* dst_u8, const uint8_t* src_u8,
++    int K, int N_total, int n_offset, int n_segment) {
++
++    auto dst = reinterpret_cast<uint16_t*>(dst_u8);
++    auto src = reinterpret_cast<const uint16_t*>(src_u8);
++
++    GGML_ASSERT(K % 32 == 0 && N_total > 0 && K > 0);
++    GGML_ASSERT(n_offset % 16 == 0 && n_segment % 16 == 0 && n_offset + n_segment <= N_total);
++
++    const size_t s0 = (size_t)(K / 32) * 16 * 32;
++    const size_t s1 = 16 * 32;
++    const size_t s2 = 32;
++
++    for (int i = 0; i < n_segment / 16; ++i) {
++        for (int j = 0; j < K / 32; ++j) {
++            const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
++            for (int ii = 0; ii < 16; ++ii) {
++                const size_t n_global = (size_t)n_offset + (size_t)i * 16 + (size_t)ii;
++                
++                const uint16_t * src_ptr = src + n_global * K + j * 32;
++                uint16_t * dst_ptr = dst + dst_block + ii * s2;
++
++                uint16x8_t d0 = vld1q_u16(src_ptr + 0);
++                uint16x8_t d1 = vld1q_u16(src_ptr + 8);
++                uint16x8_t d2 = vld1q_u16(src_ptr + 16);
++                uint16x8_t d3 = vld1q_u16(src_ptr + 24);
++
++                vst1q_u16(dst_ptr + 0, d0);
++                vst1q_u16(dst_ptr + 8, d1);
++                vst1q_u16(dst_ptr + 16, d2);
++                vst1q_u16(dst_ptr + 24, d3);
++            }
++        }
++    }
++}
++
++// Packing KxN INT8 (row-major) into native RKNN for RK3588: (N/32, K/32, 32, 32)
++void pack_B_rk3588_int8(
++    uint8_t* dst_u8, const uint8_t* src_u8,
++    int K, int N_total, int n_offset, int n_segment) {
++
++    auto dst = reinterpret_cast<int8_t*>(dst_u8);
++    auto src = reinterpret_cast<const int8_t*>(src_u8);
++
++    GGML_ASSERT(K % 32 == 0 && N_total > 0 && K > 0);
++    GGML_ASSERT(n_offset % 32 == 0 && n_segment % 32 == 0 && n_offset + n_segment <= N_total);
++
++    const size_t s0 = (size_t)(K / 32) * 32 * 32;
++    const size_t s1 = 32 * 32;
++    const size_t s2 = 32;
++
++    for (int i = 0; i < n_segment / 32; ++i) {
++        for (int j = 0; j < K / 32; ++j) {
++            const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
++            for (int ii = 0; ii < 32; ++ii) {
++                const size_t n_global = (size_t)n_offset + (size_t)i * 32 + (size_t)ii;
++
++                const int8_t* src_ptr = src + n_global * K + j * 32;
++                int8_t* dst_ptr = dst + dst_block + ii * s2;
++
++                int8x16_t d0 = vld1q_s8(src_ptr);
++                int8x16_t d1 = vld1q_s8(src_ptr + 16);
++
++                vst1q_s8(dst_ptr, d0);
++                vst1q_s8(dst_ptr + 16, d1);
++            }
++        }
++    }
++}
++
++// Packing KxN INT4 (row-major) into native RKNN for RK3588: (N/64, K/32, 64, 32)
++void pack_B_rk3588_int4(
++    uint8_t * dst, const uint8_t * src,
++    int K, int N_total, int n_offset, int n_segment) {
++
++    GGML_ASSERT(K % 32 == 0 && N_total > 0 && K > 0);
++    GGML_ASSERT(n_offset % 64 == 0 && n_segment % 64 == 0 && n_offset + n_segment <= N_total);
++
++    const size_t s0 = (size_t)(K / 32) * 64 * (32 / 2);
++    const size_t s1 = 64 * (32 / 2);
++    const size_t s2 = (32 / 2); 
++
++    const size_t src_row_stride_bytes = (size_t)K / 2;
++
++    for (int i = 0; i < n_segment / 64; ++i) {
++        for (int j = 0; j < K / 32; ++j) {
++            const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
++            for (int ii = 0; ii < 64; ++ii) {
++                const size_t n_global = (size_t)n_offset + (size_t)i * 64 + (size_t)ii;
++
++                const uint8_t* src_ptr = src + n_global * src_row_stride_bytes + (j * 32) / 2;
++                uint8_t* dst_ptr = dst + dst_block + ii * s2;
++
++                uint8x16_t d0 = vld1q_u8(src_ptr);
++                vst1q_u8(dst_ptr, d0);
++            }
++        }
++    }
++}
++
++} // anonymous namespace
++
++
++namespace rknpu2_configuration {
++
++Rknpu2ConfigManager& Rknpu2ConfigManager::get_instance() {
++    static Rknpu2ConfigManager instance;
++    return instance;
++}
++
++Rknpu2ConfigManager::Rknpu2ConfigManager() {
++    // --- Define RK3588 Configuration ---
++    Rknpu2DeviceConfig rk3588_config;
++    rk3588_config.device_name = "RK3588";
++    rk3588_config.core_count = 3;
++    rk3588_config.supported_ops = {
++        {
++            /* .type_w    = */ GGML_TYPE_F16,               // Weights must be converted from F16
++            /* .type_a    = */ GGML_TYPE_F32,
++            /* .npu_type_a = */ NPU_TYPE_FP16,              // Activations must be converted to FP16
++            /* .npu_type_c = */ NPU_TYPE_FP32,              // Result is already in FP32
++            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
++            /* .k_align   = */ 32,
++            /* .n_align   = */ 16,
++            /* .pack_func = */ pack_B_rk3588_fp16
++        },
++        {
++            /* .type_w    = */ GGML_TYPE_Q8_0,              // Weights must be converted from Q8_0
++            /* .type_a    = */ GGML_TYPE_F32,
++            /* .npu_type_a = */ NPU_TYPE_INT8,              // Activations must be converted to INT8
++            /* .npu_type_c = */ NPU_TYPE_INT32,             // Result must be converted from INT32
++            /* .mm_type   = */ RKNN_INT8_MM_INT8_TO_INT32,
++            /* .k_align   = */ 32,
++            /* .n_align   = */ 32,
++            /* .pack_func = */ pack_B_rk3588_int8
++        },
++        {
++            /* .type_w    = */ GGML_TYPE_Q4_0,              // Weights must be converted from Q4_0
++            /* .type_a    = */ GGML_TYPE_F32,
++            /* .npu_type_a = */ NPU_TYPE_INT4,              // Activations must be converted to INT4
++            /* .npu_type_c = */ NPU_TYPE_INT16,             // Result must be converted from INT16
++            /* .mm_type   = */ RKNN_INT4_MM_INT4_TO_INT16,
++            /* .k_align   = */ 32,
++            /* .n_align   = */ 64,
++            /* .pack_func = */ pack_B_rk3588_int4
++        }
++    };
++    device_configs["RK3588"] = rk3588_config;
++
++    // --- Define RK3576 Configuration (Placeholder) ---
++    // Rknpu2DeviceConfig rk3576_config;
++    // ... fill config for RK3576 ...
++    // device_configs["RK3576"] = rk3576_config;
++
++    // --- Define RK3566 Configuration (Placeholder) ---
++    // Rknpu2DeviceConfig rk3566_config;
++    // ... fill config for RK3566 ...
++    // device_configs["RK3566"] = rk3566_config;
++
++    // Select a default device
++    if (!device_configs.empty()) {
++        select_device(device_configs.begin()->first);
++    }
++}
++
++bool Rknpu2ConfigManager::select_device(const std::string& device_name) {
++    auto it = device_configs.find(device_name);
++    if (it != device_configs.end()) {
++        current_config = &it->second;
++        return true;
++    }
++    return false;
++}
++
++const Rknpu2DeviceConfig& Rknpu2ConfigManager::get_current_config() const {
++    GGML_ASSERT(current_config != nullptr && "No device configuration selected or available.");
++    return *current_config;
++}
++
++} // namespace rknpu2_configuration
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-configuration.h b/ggml/src/ggml-rknpu2/rknpu2-configuration.h
+new file mode 100644
+index 000000000..c58d92110
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-configuration.h
+@@ -0,0 +1,136 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <rknn_matmul_api.h>
++
++#include <string>
++#include <vector>
++#include <map>
++#include <functional>
++#include <cstdint>
++
++namespace rknpu2_configuration {
++
++// Forward declaration for packing function pointer
++struct ggml_tensor;
++
++/**
++ * @brief Defines a function signature for packing a segment of the weight matrix (B)
++ * from a standard row-major layout into the device-specific native layout.
++ *
++ * @param dst Pointer to the destination buffer for the packed data.
++ * @param src Pointer to the source data in row-major layout (ggml format).
++ * @param K The number of columns in the source matrix (inner dimension).
++ * @param N_total The total number of rows in the source matrix.
++ * @param n_offset The row offset from which to start packing.
++ * @param n_segment The number of rows to pack.
++ */
++using PackingFunction = std::function<void(
++    uint8_t* dst,
++    const uint8_t* src,
++    int K,
++    int N_total,
++    int n_offset,
++    int n_segment
++)>;
++
++/**
++ * @brief An abstract representation of data types used on the NPU side.
++ * This helps decouple the main logic from specific ggml or rknn types.
++ */
++enum Rknpu2NpuType {
++    NPU_TYPE_INT4,
++    NPU_TYPE_INT8,
++    NPU_TYPE_INT16,
++    NPU_TYPE_INT32,
++    NPU_TYPE_FP16,
++    NPU_TYPE_FP32,
++};
++
++/**
++ * @brief Describes a single supported matrix multiplication operation on the NPU.
++ *
++ * This struct maps a combination of ggml tensor types for weights (src0) and
++ * activations (src1) to a specific RKNN matmul type. It also specifies the
++ * hardware alignment requirements for the K and N dimensions of the matrices.
++ */
++struct Rknpu2Operation {
++    ggml_type type_w;           // Weight tensor type
++    ggml_type type_a;           // Activation tensor type
++    
++    Rknpu2NpuType npu_type_a;   // The target data type for activations on the NPU
++    Rknpu2NpuType npu_type_c;   // The data type of the result from the NPU
++    rknn_matmul_type mm_type;   // Corresponding RKNN operation type
++    
++    int k_align;                // Required alignment for the K dimension
++    int n_align;                // Required alignment for the N dimension
++    PackingFunction pack_func;  // Function to pack the weight matrix for this op
++};
++
++/**
++ * @brief Holds the complete hardware configuration for a specific Rockchip NPU.
++ *
++ * This includes the device name, number of available NPU cores, and a list of
++ * all matrix multiplication operations supported by the hardware.
++ */
++struct Rknpu2DeviceConfig {
++    std::string device_name;
++    int core_count;
++    std::vector<Rknpu2Operation> supported_ops;
++
++    /**
++     * @brief Finds the corresponding operation configuration for the given weight type.
++     * @param w_type The ggml_type of the weight tensor.
++     * @return A pointer to the Rknpu2Operation if found, otherwise nullptr.
++     */
++    const Rknpu2Operation* find_op_support(ggml_type w_type) const {
++        for (const auto& op : supported_ops) {
++            if (op.type_w == w_type) {
++                return &op;
++            }
++        }
++        return nullptr;
++    }
++};
++
++/**
++ * @brief Manages and provides access to hardware configurations for different Rockchip NPUs.
++ *
++ * This is a singleton class that should be initialized once. It allows selecting
++ * a specific device configuration (e.g., for "RK3588") which can then be
++ * accessed globally to drive backend logic.
++ */
++class Rknpu2ConfigManager {
++public:
++    /**
++     * @brief Get the singleton instance of the manager.
++     * @return Reference to the Rknpu2ConfigManager instance.
++     */
++    static Rknpu2ConfigManager& get_instance();
++
++    /**
++     * @brief Selects the active device configuration.
++     * @param device_name The name of the device to activate (e.g., "RK3588").
++     * @return True if the configuration was found and set, false otherwise.
++     */
++    bool select_device(const std::string& device_name);
++
++    /**
++     * @brief Get the currently active device configuration.
++     * @return A constant reference to the active Rknpu2DeviceConfig.
++     */
++    const Rknpu2DeviceConfig& get_current_config() const;
++
++private:
++    // Private constructor, destructor, and copy operators to enforce singleton pattern
++    Rknpu2ConfigManager();
++    ~Rknpu2ConfigManager() = default;
++    Rknpu2ConfigManager(const Rknpu2ConfigManager&) = delete;
++    Rknpu2ConfigManager& operator=(const Rknpu2ConfigManager&) = delete;
++
++    std::map<std::string, Rknpu2DeviceConfig> device_configs;
++    const Rknpu2DeviceConfig* current_config = nullptr;
++};
++
++} // namespace rknpu2_configuration
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-quantization.cpp b/ggml/src/ggml-rknpu2/rknpu2-quantization.cpp
+new file mode 100644
+index 000000000..1d87070f3
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-quantization.cpp
+@@ -0,0 +1,82 @@
++#include <arm_neon.h>
++#include <cmath>
++#include <algorithm>
++
++#include "rknpu2-quantization.h"
++
++namespace rknpu2_quantization {
++
++// --- Conversion from FP32 ---
++
++void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements) {
++    size_t i = 0;
++#ifdef __ARM_NEON
++    for (; i + 7 < n_elements; i += 8) {
++        float32x4_t f32_vec_0 = vld1q_f32(src + i);
++        float32x4_t f32_vec_1 = vld1q_f32(src + i + 4);
++        float16x8_t f16_vec = vcombine_f16(vcvt_f16_f32(f32_vec_0), vcvt_f16_f32(f32_vec_1));
++        vst1q_u16(dst + i, (uint16x8_t)f16_vec);
++    }
++#endif
++    for (; i < n_elements; ++i) {
++        dst[i] = GGML_FP32_TO_FP16(src[i]);
++    }
++}
++
++void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale) {
++    const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
++    for (size_t i = 0; i < n_elements; ++i) {
++        dst[i] = (int8_t)roundf(src[i] * iscale);
++    }
++}
++
++void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale) {
++    const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
++    for (size_t i = 0; i < n_elements / 2; ++i) {
++        float v0_f = src[i * 2 + 0] * iscale;
++        float v1_f = src[i * 2 + 1] * iscale;
++
++        int8_t v0_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v0_f)));
++        int8_t v1_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v1_f)));
++
++        dst[i] = ((uint8_t)v0_i & 0x0F) | (((uint8_t)v1_i & 0x0F) << 4);
++    }
++}
++
++
++// --- Dequantization to FP32 ---
++
++void dequantize_int16_to_fp32(const int16_t * src, float * dst, size_t n_elements, float scale) {
++    size_t i = 0;
++#ifdef __ARM_NEON
++    const float32x4_t scale_vec = vdupq_n_f32(scale);
++    for (; i + 3 < n_elements; i += 4) {
++        int16x4_t i16_vec = vld1_s16(src + i);
++        int32x4_t i32_vec = vmovl_s16(i16_vec);
++        float32x4_t f32_vec = vcvtq_f32_s32(i32_vec);
++        f32_vec = vmulq_f32(f32_vec, scale_vec);
++        vst1q_f32(dst + i, f32_vec);
++    }
++#endif
++    for (; i < n_elements; ++i) {
++        dst[i] = (float)src[i] * scale;
++    }
++}
++
++void dequantize_int32_to_fp32(const int32_t * src, float * dst, size_t n_elements, float scale) {
++    size_t i = 0;
++#ifdef __ARM_NEON
++    const float32x4_t scale_vec = vdupq_n_f32(scale);
++    for (; i + 3 < n_elements; i += 4) {
++        int32x4_t i32_vec = vld1q_s32(src + i);
++        float32x4_t f32_vec = vcvtq_f32_s32(i32_vec);
++        f32_vec = vmulq_f32(f32_vec, scale_vec);
++        vst1q_f32(dst + i, f32_vec);
++    }
++#endif
++    for (; i < n_elements; ++i) {
++        dst[i] = (float)src[i] * scale;
++    }
++}
++
++} // namespace rknpu2_quantization
+\ No newline at end of file
+diff --git a/ggml/src/ggml-rknpu2/rknpu2-quantization.h b/ggml/src/ggml-rknpu2/rknpu2-quantization.h
+new file mode 100644
+index 000000000..b15f5f843
+--- /dev/null
++++ b/ggml/src/ggml-rknpu2/rknpu2-quantization.h
+@@ -0,0 +1,83 @@
++#pragma once
++
++#include "ggml-impl.h"
++
++#include <stdint.h>
++#include <stddef.h>
++
++/**
++ * @brief A collection of quantization and data type conversion utilities for the RKNPU backend.
++ *
++ * This namespace provides optimized functions for converting between floating-point
++ * and various integer formats (FP16, INT8, INT4) required by the Rockchip NPU.
++ * It also serves as a centralized place for dequantization routines.
++ */
++namespace rknpu2_quantization {
++
++// --- Conversion from FP32 ---
++
++/**
++ * @brief Converts a row of FP32 values to FP16.
++ * @param src Pointer to the source FP32 data.
++ * @param dst Pointer to the destination FP16 (uint16_t) data.
++ * @param n_elements The number of elements to convert.
++ */
++void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements);
++
++/**
++ * @brief Symmetrically quantizes a row of FP32 values to INT8.
++ *
++ * The quantization formula is: `dst[i] = round(src[i] / scale)`.
++ * The caller is responsible for calculating the appropriate scale
++ * (e.g., `amax / 127.0f`).
++ *
++ * @param src Pointer to the source FP32 data.
++ * @param dst Pointer to the destination INT8 data.
++ * @param n_elements The number of elements to quantize.
++ * @param scale The quantization scale factor.
++ */
++void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale);
++
++/**
++ * @brief Symmetrically quantizes a row of FP32 values to INT4 and packs them.
++ *
++ * The quantization formula is: `v = round(src[i] / scale)`. Values are clamped to [-8, 7].
++ * Two INT4 values are packed into a single uint8_t.
++ * The caller is responsible for calculating the appropriate scale
++ * (e.g., `amax / 7.0f`).
++ *
++ * @param src Pointer to the source FP32 data.
++ * @param dst Pointer to the destination packed INT4 (uint8_t) data.
++ * @param n_elements The number of elements to quantize (must be a multiple of 2).
++ * @param scale The quantization scale factor.
++ */
++void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale);
++
++
++// --- Dequantization to FP32 ---
++
++/**
++ * @brief Dequantizes a row of INT16 values to FP32.
++ *
++ * The dequantization formula is: `dst[i] = src[i] * scale`.
++ *
++ * @param src Pointer to the source INT16 data.
++ * @param dst Pointer to the destination FP32 data.
++ * @param n_elements The number of elements to dequantize.
++ * @param scale The dequantization scale factor.
++ */
++void dequantize_int16_to_fp32(const int16_t * src, float * dst, size_t n_elements, float scale);
++
++/**
++ * @brief Dequantizes a row of INT32 values to FP32.
++ *
++ * The dequantization formula is: `dst[i] = src[i] * scale`.
++ *
++ * @param src Pointer to the source INT32 data.
++ * @param dst Pointer to the destination FP32 data.
++ * @param n_elements The number of elements to dequantize.
++ * @param scale The dequantization scale factor.
++ */
++void dequantize_int32_to_fp32(const int32_t * src, float * dst, size_t n_elements, float scale);
++
++} // namespace rknpu2_quantization
+\ No newline at end of file
