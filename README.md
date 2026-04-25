@@ -1,3 +1,59 @@
+# rockllama.cpp
+
+> **Fork de [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) com suporte ao Rockchip NPU (RKNPU2)**
+
+[![Sync Check](https://github.com/fukumori/rockllama.cpp/actions/workflows/sync-check.yml/badge.svg)](https://github.com/fukumori/rockllama.cpp/actions/workflows/sync-check.yml)
+
+## Sobre
+
+Este repositório mantém a integração do backend **RKNPU2** (Rockchip NPU) com o `llama.cpp` sempre atualizado com o upstream.
+
+### Baseado em
+
+| Repositório | Papel |
+|---|---|
+| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | Upstream principal — base do fork |
+| [invisiofficial/rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp/tree/rknpu2) | Backend RKNPU2 para Rockchip SoCs |
+
+### Hardware suportado
+
+- RK3588 / RK3588S
+- RK3566 / RK3568
+- Qualquer SoC Rockchip com NPU via RKNPU2
+
+## Build com RKNPU2
+
+```bash
+# Clone
+git clone https://github.com/fukumori/rockllama.cpp.git
+cd rockllama.cpp
+
+# Build com suporte RKNPU2
+cmake -B build -DGGML_RKNPU2=ON
+cmake --build build -j$(nproc)
+```
+
+## Estratégia de Sincronização
+
+- Os patches do RKNPU2 ficam em `patches/` como arquivos `.patch` versionados
+- O GitHub Actions verifica semanalmente se os patches ainda aplicam sobre o upstream
+- Para sincronizar manualmente: `bash scripts/sync-upstream.sh`
+
+### Estrutura de branches
+
+```
+master            ← branch estável (base = upstream llama.cpp)
+rknpu2-patches    ← espelho do branch rknpu2 do rk-llama.cpp
+```
+
+### Aplicar patches manualmente
+
+```bash
+git am patches/*.patch
+```
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
