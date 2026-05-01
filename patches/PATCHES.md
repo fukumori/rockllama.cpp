@@ -1,6 +1,7 @@
 # Patches RKNPU2 para rockllama.cpp
 
-Patches gerados de: https://github.com/invisiofficial/rk-llama.cpp/tree/rknpu2
+Patches 0001-0011 gerados de: https://github.com/invisiofficial/rk-llama.cpp/tree/rknpu2
+Patches 0012-0013 cherry-picked de: https://github.com/happyme531/rk-llama.cpp/tree/rknpu2
 
 ## Como aplicar manualmente
 
@@ -28,6 +29,8 @@ git format-patch HEAD..rknpu2/rknpu2 --output-directory=patches/ --no-signature
 - `0009-Fix-cmake-for-cross-compiling-8.patch`: Fix cmake for cross-compiling (#8)
 - `0010-Caching-System-is-fixed.patch`: Caching System is fixed
 - `0011-Several-Environment-Variables-for-QoL-are-implemente.patch`: Several Environment Variables for QoL are implemented
+- `0012-ggml-rknpu2-Fix-weight-buffer-overflow-issue.patch`: Fix weight buffer overflow (happyme531)
+- `0013-rknpu-reject-higher-rank-mul_mat-tensors.patch`: Reject higher-rank mul_mat tensors (happyme531)
 
 ---
 _Atualizado automaticamente pelo script de sync_

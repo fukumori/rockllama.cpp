@@ -1,0 +1,38 @@
+From 3a966a7ccff5085525ce174cb530fde6433f783a Mon Sep 17 00:00:00 2001
+From: hallo1 <2302004040@qq.com>
+Date: Fri, 17 Apr 2026 22:40:54 +0800
+Subject: [PATCH 12/13] ggml-rknpu2: Fix weight buffer overflow issue
+
+---
+ ggml/src/ggml-rknpu2/ggml-rknpu2.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+index bd4c987..2008b84 100644
+--- a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
++++ b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+@@ -1226,7 +1226,13 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
+ 
+ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+     UNUSED(buft);
+-    return get_tensor_packed_size(tensor);
++    const size_t packed_size = get_tensor_packed_size(tensor);
++    const size_t nbytes = ggml_nbytes(tensor);
++
++    // ggml requires backend allocation size to cover the original tensor bytes.
++    // RKNPU may repack weights into a denser device layout, but model loading can
++    // still read/copy ggml_nbytes() worth of source data during initialization.
++    return std::max(packed_size, nbytes);
+ }
+ 
+ 
+@@ -1454,4 +1460,4 @@ GGML_API ggml_backend_reg_t ggml_backend_rknpu2_reg(void) {
+ 
+ #ifdef GGML_BACKEND_DL
+ GGML_BACKEND_DL_IMPL(ggml_backend_rknpu2_reg)
+-#endif
+\ No newline at end of file
++#endif
+-- 
+2.43.0
+
