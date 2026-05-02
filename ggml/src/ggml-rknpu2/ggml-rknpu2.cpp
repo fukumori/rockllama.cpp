@@ -67,6 +67,44 @@ static bool rknpu_force_dynamic_b() {
     return enabled;
 }
 
+// F8.6b stability cap: max M_total (= M * n_heads) safe for one matmul
+// submission, derived from RK3588 NPU CBUF limits. CBUF has 12 banks ×
+// 32 KB; the librknnrt 2.3.2 driver appears to need at least 2 banks
+// reserved for weight, leaving (12-2)*32768 bytes for data. A row of
+// A occupies align_up(K, 32) * sizeof(npu_type_a) bytes, so
+//   max_M = 10 * 32768 / (align_up(K, 32) * type_a_bytes).
+// Crossing this segfaults inside librknnrt for the affected shape
+// (observed at M_total=2048, K=512, FP16). Reference: allbilly/npu
+// matmul_fix_424 branch, which solves the same limit with explicit
+// M-tiling. We currently only gate; F8.6c can replace the gate with
+// a real M-tile loop.
+static int rknpu_max_m_for_cbuf(const rknpu2_configuration::Rknpu2HardwarePipeline* pipeline, int K_seg) {
+    constexpr int CBUF_BANK_BYTES = 32768;
+    constexpr int CBUF_BANKS = 12;
+    constexpr int WEIGHT_BANKS_RESERVED = 2;
+    const int data_banks = CBUF_BANKS - WEIGHT_BANKS_RESERVED;
+    const int align_in = ((K_seg + 31) / 32) * 32;
+
+    size_t row_bytes;
+    switch (pipeline->npu_type_a) {
+        case rknpu2_configuration::NPU_TYPE_INT4:
+            row_bytes = (size_t)align_in / 2; // 4 bits per element, packed
+            break;
+        case rknpu2_configuration::NPU_TYPE_INT8:
+            row_bytes = (size_t)align_in;
+            break;
+        default: // FP16 / FP32
+            row_bytes = (size_t)align_in * 2;
+            break;
+    }
+    if (row_bytes == 0) return std::numeric_limits<int>::max();
+
+    const size_t cbuf_data_bytes = (size_t)data_banks * (size_t)CBUF_BANK_BYTES;
+    int max_m = (int)(cbuf_data_bytes / row_bytes);
+    if (max_m < 1) max_m = 1;
+    return max_m;
+}
+
 // F8.6a gate: minimum M (src1->ne[1] = q_len) required to route a batched
 // rank-3 mul_mat to the NPU. Decode (M=1) is dominated by per-call B prep
 // overhead and runs faster on CPU; prefill / chunk passes (M >= 16) are
@@ -1725,6 +1763,24 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                         rknpu_log_batched_shape_once(src0, src1, op);
                     }
                     return false;
+                }
+
+                // F8.6b stability cap: F8.6b's flatten asks the NPU for one
+                // matmul of M_total = M * n_heads rows. CBUF can't hold A
+                // larger than max_m rows for the given K, and the librknnrt
+                // 2.3.2 driver crashes silently past that. Reject the op so
+                // it falls back to CPU; F8.6c will replace this with M-tiling.
+                const auto* pipe_for_cap = config.resolve_op_support(src0);
+                if (pipe_for_cap) {
+                    const int K_seg_worst = (int)src0->ne[0];
+                    const int max_m = rknpu_max_m_for_cbuf(pipe_for_cap, K_seg_worst);
+                    const int64_t M_total = src1->ne[1] * src1->ne[2];
+                    if (M_total > max_m) {
+                        if (rknpu_batched_diag_enabled()) {
+                            rknpu_log_batched_shape_once(src0, src1, op);
+                        }
+                        return false;
+                    }
                 }
             }
 
