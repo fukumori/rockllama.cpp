@@ -1507,6 +1507,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
+
+        // TST.2: also keep the raw GGUF bytes in tensor->data so cross-backend
+        // copies (ggml_backend_tensor_copy via get_tensor) and any other
+        // external read-back returns the original format instead of the
+        // NPU-packed bytes that live in alloc.mem. tensor->data already lives
+        // inside the mmap'd virtual_base, so this is a one-time extra memcpy
+        // at model load with no additional allocation.
+        memcpy((uint8_t*)tensor->data + offset, data, size);
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
     }
@@ -1514,15 +1522,13 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context*)buffer->context;
-    size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
+    UNUSED(ctx);
 
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
-    if (it != ctx->tensor_allocs.end()) {
-        memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
-    } else {
-        memcpy(data, (uint8_t*)tensor->data + offset, size);
-    }
+    // TST.2: tensor->data is now the source of truth for the original GGUF
+    // bytes (set_tensor's pipeline path memcpy's there too). Reading from
+    // alloc.mem would give NPU-packed bytes, which CPU consumers cannot
+    // interpret as Q8_0 / F16 / etc — see TST.1 findings.
+    memcpy(data, (uint8_t*)tensor->data + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
