@@ -52,6 +52,21 @@ static bool rknpu_batched_mm_enabled() {
     return enabled;
 }
 
+// TST.3 / debug override: when RKNPU_FORCE_DYNAMIC_B=1, graph_compute
+// pretends src0 is never pre-quantized, forcing the dynamic-B path
+// (prepare_b_dynamic_segment) even for tensors that went through
+// set_tensor's pipeline path. Used to exercise dynamic-B from the
+// existing test_mul_mat infrastructure (which always allocates src0 in
+// the test backend's buffer, so set_tensor marks it pre_quantized=true
+// and the static path would otherwise win). Production-safe default off.
+static bool rknpu_force_dynamic_b() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("RKNPU_FORCE_DYNAMIC_B");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 // F8.6a gate: minimum M (src1->ne[1] = q_len) required to route a batched
 // rank-3 mul_mat to the NPU. Decode (M=1) is dominated by per-call B prep
 // overhead and runs faster on CPU; prefill / chunk passes (M >= 16) are
@@ -711,7 +726,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 b_domain_id = it->second.iommu_domain_id;
             }
         }
-        const bool use_static_path = src0_is_pre_quantized;
+        const bool use_static_path = src0_is_pre_quantized && !rknpu_force_dynamic_b();
 
         const size_t src1_head_stride = (n_heads > 1) ? (src1->nb[2] / sizeof(float)) : 0;
         const size_t dst_head_stride  = (n_heads > 1) ? (dst->nb[2]  / sizeof(float)) : 0;
@@ -1559,6 +1574,14 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    // TST.2 follow-up: tensor->data lives in virtual_base and is the source
+    // of truth for get_tensor and the dynamic-B path. Clearing only alloc.mem
+    // would leave stale GGUF bytes visible on read-back. Clear the whole
+    // virtual_base so semantics match the CPU backend's clear.
+    if (ctx->virtual_base) {
+        memset(ctx->virtual_base, value, ctx->total_size);
+    }
 
     for (auto& pair : ctx->tensor_allocs) {
         memset((uint8_t*)pair.second.mem->virt_addr, value, pair.second.size);
