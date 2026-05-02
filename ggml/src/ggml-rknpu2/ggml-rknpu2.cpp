@@ -25,8 +25,51 @@
 #include <limits>
 #include <sys/mman.h>
 #include <sstream>
+#include <cstdio>
+#include <unordered_set>
 
 #define UNUSED(x) (void)(x)
+
+// F8.0 diagnostic: when RKNPU_BATCHED_MM_DIAGNOSTIC=1, log shapes that the
+// supports_op rank>2 guard rejects today. Used to scope the F8 work without
+// changing behavior. Each unique shape is logged once to stderr.
+static bool rknpu_batched_diag_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("RKNPU_BATCHED_MM_DIAGNOSTIC");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+static void rknpu_log_batched_shape_once(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * op) {
+    static std::mutex m;
+    static std::unordered_set<std::string> seen;
+
+    char key[768];
+    std::snprintf(key, sizeof(key),
+        "name=%s op_name=%s "
+        "src0=%s[%lld,%lld,%lld,%lld]@nb[%zu,%zu,%zu,%zu] "
+        "src1=%s[%lld,%lld,%lld,%lld]@nb[%zu,%zu,%zu,%zu] "
+        "dst=%s[%lld,%lld,%lld,%lld]",
+        op->name[0]   ? op->name   : "?",
+        src0->name[0] ? src0->name : "?",
+        ggml_type_name(src0->type),
+        (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
+        (size_t)src0->nb[0], (size_t)src0->nb[1], (size_t)src0->nb[2], (size_t)src0->nb[3],
+        ggml_type_name(src1->type),
+        (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
+        (size_t)src1->nb[0], (size_t)src1->nb[1], (size_t)src1->nb[2], (size_t)src1->nb[3],
+        ggml_type_name(op->type),
+        (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3]);
+
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.insert(key).second) {
+        std::fprintf(stderr, "RKNPU_BATCHED_DIAG %s\n", key);
+    }
+}
 
 // --- IOMMU Domain Manager ---
 
@@ -1295,6 +1338,9 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
                 src1->ne[2] != 1 || src1->ne[3] != 1 ||
                 op->ne[2]   != 1 || op->ne[3]   != 1) {
+                if (rknpu_batched_diag_enabled()) {
+                    rknpu_log_batched_shape_once(src0, src1, op);
+                }
                 return false;
             }
 
