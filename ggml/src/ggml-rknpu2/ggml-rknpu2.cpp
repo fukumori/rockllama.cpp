@@ -52,6 +52,21 @@ static bool rknpu_batched_mm_enabled() {
     return enabled;
 }
 
+// F8.6a gate: minimum M (src1->ne[1] = q_len) required to route a batched
+// rank-3 mul_mat to the NPU. Decode (M=1) is dominated by per-call B prep
+// overhead and runs faster on CPU; prefill / chunk passes (M >= 16) are
+// where the NPU has a shot. Default 16; override with RKNPU_BATCHED_MM_MIN_M.
+// Setting to 0 disables the gate entirely.
+static int rknpu_batched_mm_min_m() {
+    static const int value = []() {
+        const char* v = std::getenv("RKNPU_BATCHED_MM_MIN_M");
+        if (v == nullptr || v[0] == '\0') return 16;
+        const int parsed = std::atoi(v);
+        return parsed >= 0 ? parsed : 16;
+    }();
+    return value;
+}
+
 static void rknpu_log_batched_shape_once(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
@@ -1674,6 +1689,16 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                 }
                 // dst's head dim must match src1's; we slice both by nb[2].
                 if (op->ne[2] != src1->ne[2]) {
+                    return false;
+                }
+                // F8.6a: gate small-M (decode) shapes off the NPU. Per-call
+                // B-prep on F16 K/V cache slices is more expensive than the
+                // CPU matmul for M=1 and very small M.
+                const int min_m = rknpu_batched_mm_min_m();
+                if (min_m > 0 && (int)src1->ne[1] < min_m) {
+                    if (rknpu_batched_diag_enabled()) {
+                        rknpu_log_batched_shape_once(src0, src1, op);
+                    }
                     return false;
                 }
             }
