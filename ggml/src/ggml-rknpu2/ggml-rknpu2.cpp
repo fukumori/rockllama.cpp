@@ -408,6 +408,13 @@ struct ggml_backend_rknpu_context {
     // C-matrices cache (M, N, core_id, npu_type_c, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
 
+    // F8.2 dynamic-B path: matmul ctx cache keyed only by shape (no tensor_id/offset),
+    // since for dynamic B we re-bind the B memory on every call.
+    std::unordered_map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> dynamic_matmul_ctx_cache;
+
+    // F8.2 dynamic-B path: per-shape DMA buffer cache for B (re-quantized in-place per call).
+    std::unordered_map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> b_dynamic_buffer_cache;
+
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
 
@@ -438,8 +445,71 @@ struct ggml_backend_rknpu_context {
         matmul_ctx_cache[key] = ctx;
         return ctx;
     }
+
+    // F8.2 dynamic-B variant of get_matmul_ctx. Same RKNN ctx setup as the
+    // static path, but cached purely by shape so different src0 tensors that
+    // share the same (M, K, N, core, type, domain) reuse the same context.
+    std::shared_ptr<rknpu_matmul_context> get_dynamic_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto key = std::make_tuple(M, K, N, core_id, (int)type, (int)domain_id);
+        auto it = dynamic_matmul_ctx_cache.find(key);
+        if (it != dynamic_matmul_ctx_cache.end()) {
+            return it->second;
+        }
+
+        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
+        if (ctx->ctx == 0) {
+            return nullptr;
+        }
+
+        rknn_core_mask core_mask;
+        switch (core_id) {
+            case 0: core_mask = RKNN_NPU_CORE_0; break;
+            case 1: core_mask = RKNN_NPU_CORE_1; break;
+            case 2: core_mask = RKNN_NPU_CORE_2; break;
+            default: core_mask = RKNN_NPU_CORE_AUTO; break;
+        }
+
+        int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
+        if (ret != RKNN_SUCC) {
+            // Handle error
+        }
+
+        dynamic_matmul_ctx_cache[key] = ctx;
+        return ctx;
+    }
 };
 
+
+// F8.2 forward declarations: helpers for the dynamic-B path live further down
+// the file (next to the matching set_tensor helpers); graph_compute needs them
+// before they are defined.
+static const char * ggml_backend_rknpu_buffer_type_get_name(ggml_backend_buffer_type_t buft);
+static void dequantize_row(
+    const struct ggml_tensor * tensor, const void * raw_data,
+    int n, int K, float * row_out);
+static void pack_native(
+    uint8_t* dst, const uint8_t* src,
+    int K_total, int k_offset, int k_segment, int k_align,
+    int N_total, int n_offset, int n_segment, int n_align,
+    int element_bits);
+static float prepare_b_dynamic_segment(
+    const struct ggml_tensor * src0, const void * src0_raw,
+    int K, int N, int K_op,
+    const struct MatrixSegmentK & k_seg,
+    const struct MatrixSegmentN & n_seg,
+    const rknpu2_configuration::Rknpu2HardwarePipeline * pipeline,
+    const float * s_vec_data,
+    uint8_t * dst_dma_ptr);
+
+// F8.2: identify whether a tensor is backed by the RKNPU buffer type. We use
+// the static get_name function pointer as the discriminator — comparing to a
+// local-static buffer_type instance would require exposing it across functions.
+static bool is_rknpu_buffer(const struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer || !tensor->buffer->buft) return false;
+    return tensor->buffer->buft->iface.get_name == ggml_backend_rknpu_buffer_type_get_name;
+}
 
 //
 // Backend
@@ -568,15 +638,22 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         std::shared_ptr<rknn_tensor_mem> mem_A_shared;
         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments(num_active_segments);
 
-        // Acquiring the B-matrix buffer
-        ggml_backend_buffer_t src0_buffer = src0->buffer;
-        auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
-        size_t tensor_offset_in_virtual = (uintptr_t)src0->data - (uintptr_t)src0_buf_ctx->virtual_base;
+        // F8.2: split static (pre-quantized weight) vs dynamic (per-call src0)
+        // path. Today's supports_op only routes the static case here; the
+        // dynamic branch becomes reachable once F8.3 relaxes the rank>2 guard.
+        const bool src0_in_rknpu = is_rknpu_buffer(src0);
 
+        // Acquiring the B-matrix buffer (static path only)
+        ggml_backend_rknpu_buffer_context* src0_buf_ctx = nullptr;
+        size_t tensor_offset_in_virtual = 0;
         int32_t b_domain_id = 0;
         int tensor_fd = -1;
         void* tensor_virt_addr = nullptr;
-        {
+        if (src0_in_rknpu) {
+            ggml_backend_buffer_t src0_buffer = src0->buffer;
+            src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
+            tensor_offset_in_virtual = (uintptr_t)src0->data - (uintptr_t)src0_buf_ctx->virtual_base;
+
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
             auto it = src0_buf_ctx->tensor_allocs.find(tensor_offset_in_virtual);
             GGML_ASSERT(it != src0_buf_ctx->tensor_allocs.end() && "B-matrix RKNN buffer not found");
@@ -586,29 +663,47 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             b_domain_id = it->second.iommu_domain_id;
         }
 
-        // Cleaning the C-matrix buffer
-        float* dst_data = (float*)get_tensor_real_ptr(dst);
+        // Cleaning the C-matrix buffer. dst lives in the RKNPU buffer when src0
+        // does (static); in the dynamic path dst is a normal CPU tensor.
+        float* dst_data = src0_in_rknpu ? (float*)get_tensor_real_ptr(dst) : (float*)dst->data;
         memset(dst_data, 0, (size_t)M * N * sizeof(float));
 
         // Acquiring the Hadamard vector
         std::vector<float> s_vec;
         if (is_hadamard) {
-            std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-            auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
-            GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
-            s_vec = it->second;
+            if (src0_in_rknpu) {
+                std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
+                auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
+                GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
+                s_vec = it->second;
+            } else {
+                // Dynamic path: regenerate deterministically from src0 ptr,
+                // matching the seed scheme used in buffer_set_tensor.
+                s_vec.assign(K_op, 1.0f);
+                std::mt19937 gen(reinterpret_cast<uintptr_t>(src0));
+                std::uniform_int_distribution<int> distrib(0, 1);
+                for (int k = 0; k < K_op; ++k) {
+                    s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
+                }
+            }
         }
 
-        // Calculating the B-matrix scale
+        // Calculating the B-matrix scale. Static path looks the grid up from
+        // the buffer ctx; dynamic path fills it inline below as we quantize
+        // each (k_seg, n_seg) block.
         std::vector<float> scales_B_grid;
-        if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
-            std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-            auto it = src0_buf_ctx->quantized_tensor_scales.find(src0);
-            GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scales grid not found");
-            scales_B_grid = it->second;
+        if (src0_in_rknpu) {
+            if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
+                std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
+                auto it = src0_buf_ctx->quantized_tensor_scales.find(src0);
+                GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scales grid not found");
+                scales_B_grid = it->second;
+            }
+        } else {
+            scales_B_grid.assign(all_k_segments.size() * num_active_segments, 1.0f);
         }
 
-        // Calculating tensor packed size
+        // Calculating tensor packed size (only used by the static FD-mapped layout)
         size_t type_size_packed = 0;
         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
         else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
@@ -624,10 +719,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             for (const auto& n_seg : all_n_segments) {
                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                    if (active_n_segments[idx].offset_n == n_seg.offset_n) {
+                    if (active_n_segments[idx].offset_n != n_seg.offset_n) continue;
+
+                    if (src0_in_rknpu) {
+                        // Static path: B was pre-quantized + packed at set_tensor
+                        // time and lives at a known offset inside the FD-mapped
+                        // tensor blob; bind once via create_mem_from_fd.
                         size_t offset_in_dma = current_offset_in_tensor;
 
-                        // Getting matmul context from cache
                         matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
                             (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
                             n_seg.core_id, matmul_type, b_domain_id
@@ -636,7 +735,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                         auto& matmul_ctx = matmul_ctxs[idx];
 
-                        // Assigning B-matrix only once to reduce computation overhead
                         if (!matmul_ctx->b_bound) {
                             size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
 
@@ -656,11 +754,47 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                             matmul_ctx->b_bound = true;
                         }
-                        break;
+                    } else {
+                        // F8.2 dynamic-B path: src0 is a runtime tensor (e.g.
+                        // K/V from CPU backend in attention K·Q^T), not a
+                        // pre-quantized weight. Reuse a shape-keyed matmul ctx
+                        // and a shape-keyed DMA buffer, but re-fill the B
+                        // contents and re-bind every call.
+                        const int32_t domain_id = 0;
+
+                        matmul_ctxs[idx] = backend_ctx->get_dynamic_matmul_ctx(
+                            M_op, K_seg_op, n_seg.size_n,
+                            n_seg.core_id, matmul_type, domain_id
+                        );
+                        if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
+
+                        auto& matmul_ctx = matmul_ctxs[idx];
+
+                        auto b_key = std::make_tuple(
+                            M_op, K_seg_op, n_seg.size_n, n_seg.core_id,
+                            (int)pipeline->npu_type_b, (int)domain_id);
+                        auto mem_B = get_tensor_buffer(
+                            backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.B.size,
+                            b_key, backend_ctx->b_dynamic_buffer_cache);
+                        if (!mem_B) return GGML_STATUS_FAILED;
+                        matmul_ctx->mem_B = mem_B;
+
+                        const float * s_vec_ptr = is_hadamard ? s_vec.data() : nullptr;
+                        const float block_scale = prepare_b_dynamic_segment(
+                            src0, src0->data,
+                            K, N, K_op,
+                            k_seg, n_seg, pipeline,
+                            s_vec_ptr,
+                            (uint8_t*)mem_B->virt_addr);
+                        scales_B_grid[k_idx * num_active_segments + idx] = block_scale;
+
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B dynamic");
+                        RKNN_CHECK(rknn_mem_sync(matmul_ctx->ctx, mem_B.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync B dynamic TO_DEVICE");
                     }
+                    break;
                 }
 
-                if (n_seg.size_n > 0) {
+                if (src0_in_rknpu && n_seg.size_n > 0) {
                     current_offset_in_tensor += type_size_packed > 0 ? (size_t)n_seg.size_n * K_seg_op * type_size_packed : (size_t)n_seg.size_n * K_seg_op / 2;
                 }
             }
@@ -1102,6 +1236,88 @@ static size_t pack_tensor_segment(
                 element_bits);
 
     return segment_packed_size;
+}
+
+// F8.2 dynamic-B helper: dequantize one (k_seg, n_seg) tile from src0 directly
+// (no buffer-context lookup), apply Hadamard if requested, compute the block
+// scale, quantize and pack into the supplied DMA buffer. Returns the block
+// scale so the caller can record it in scales_B_grid for dequantization in
+// the result-collection stage. Mirrors the math in buffer_set_tensor so the
+// dynamic and static paths stay numerically equivalent.
+static float prepare_b_dynamic_segment(
+    const struct ggml_tensor * src0, const void * src0_raw,
+    int K, int N, int K_op,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg,
+    const rknpu2_configuration::Rknpu2HardwarePipeline * pipeline,
+    const float * s_vec_data,
+    uint8_t * dst_dma_ptr)
+{
+    const bool use_hadamard = (s_vec_data != nullptr);
+    const size_t seg_elements = (size_t)n_seg.size_n * k_seg.size_k;
+
+    std::vector<float> seg_fp32(seg_elements, 0.0f);
+
+    #pragma omp parallel for
+    for (int i = 0; i < n_seg.size_n; ++i) {
+        const int global_n = n_seg.offset_n + i;
+        if (global_n >= N) {
+            std::memset(&seg_fp32[(size_t)i * k_seg.size_k], 0, k_seg.size_k * sizeof(float));
+            continue;
+        }
+
+        std::vector<float> row_raw(K);
+        std::vector<float> row_processed(K_op, 0.0f);
+
+        dequantize_row(src0, src0_raw, global_n, K, row_raw.data());
+
+        if (use_hadamard) {
+            std::vector<float> signed_row(K);
+            for (int k = 0; k < K; ++k) signed_row[k] = row_raw[k] * s_vec_data[k];
+            rknpu2_calibration::hadamard_transform(row_processed.data(), signed_row.data(), K, K_op);
+        } else {
+            std::memcpy(row_processed.data(), row_raw.data(), K * sizeof(float));
+        }
+
+        std::memcpy(&seg_fp32[(size_t)i * k_seg.size_k],
+                    &row_processed[k_seg.offset_k],
+                    k_seg.size_k * sizeof(float));
+    }
+
+    float block_scale = 1.0f;
+    if (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16) {
+        float amax = 0.0f;
+        if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
+            amax = rknpu2_calibration::calculate_entropy_amax(seg_fp32.data(), seg_fp32.size());
+        } else {
+            for (float v : seg_fp32) amax = std::max(amax, std::abs(v));
+        }
+        const float quant_divisor = (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) ? 7.0f : 127.0f;
+        block_scale = (amax == 0.0f) ? 1.0f : amax / quant_divisor;
+    }
+
+    std::vector<uint8_t> seg_npu;
+    int element_bits = 0;
+    if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) {
+        element_bits = 16;
+        seg_npu.resize(seg_elements * 2);
+        rknpu2_quantization::convert_fp32_to_fp16(seg_fp32.data(), (uint16_t*)seg_npu.data(), seg_elements);
+    } else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) {
+        element_bits = 8;
+        seg_npu.resize(seg_elements);
+        rknpu2_quantization::quantize_fp32_to_int8(seg_fp32.data(), (int8_t*)seg_npu.data(), seg_elements, block_scale);
+    } else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
+        element_bits = 4;
+        seg_npu.resize(seg_elements / 2);
+        rknpu2_quantization::quantize_fp32_to_int4_packed(seg_fp32.data(), seg_npu.data(), seg_elements, block_scale);
+    }
+
+    pack_native(dst_dma_ptr, seg_npu.data(),
+                k_seg.size_k, 0, k_seg.size_k, pipeline->k_align,
+                n_seg.size_n, 0, n_seg.size_n, pipeline->n_align,
+                element_bits);
+
+    return block_scale;
 }
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
