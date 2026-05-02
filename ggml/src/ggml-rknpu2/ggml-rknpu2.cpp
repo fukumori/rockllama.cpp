@@ -27,6 +27,8 @@
 #include <sstream>
 #include <cstdio>
 #include <unordered_set>
+#include <atomic>
+#include <cstdint>
 
 #define UNUSED(x) (void)(x)
 
@@ -50,6 +52,48 @@ static bool rknpu_batched_mm_enabled() {
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
+}
+
+// F8.5 route counters: per-process atomic stats so any bench / PPL run can
+// answer "where did the batched mul_mat ops actually go?" Used by the codex
+// review criteria. Printed by the backend's free hook (one summary per
+// backend lifetime); a diagnostic env flag also dumps them into stderr.
+struct RknpuRouteStats {
+    std::atomic<uint64_t> mul_mat_total{0};
+    std::atomic<uint64_t> rejected_rank{0};       // ne[3]>1, etc.
+    std::atomic<uint64_t> rejected_batched_off{0}; // RKNPU_BATCHED_MM_ENABLE=0
+    std::atomic<uint64_t> rejected_min_m{0};
+    std::atomic<uint64_t> rejected_cbuf{0};
+    std::atomic<uint64_t> rejected_other{0};      // pipeline/align/contig/...
+    std::atomic<uint64_t> accepted_rank2{0};
+    std::atomic<uint64_t> accepted_batched{0};
+    std::atomic<uint64_t> dispatched_static{0};
+    std::atomic<uint64_t> dispatched_dynamic{0};
+};
+
+static RknpuRouteStats& rknpu_route_stats() {
+    static RknpuRouteStats s;
+    return s;
+}
+
+static void rknpu_print_route_stats(const char* label) {
+    auto& s = rknpu_route_stats();
+    std::fprintf(stderr,
+        "RKNPU_ROUTE_STATS %s: mul_mat_total=%lu "
+        "rejected_rank=%lu rejected_batched_off=%lu rejected_min_m=%lu rejected_cbuf=%lu rejected_other=%lu "
+        "accepted_rank2=%lu accepted_batched=%lu "
+        "dispatched_static=%lu dispatched_dynamic=%lu\n",
+        label,
+        (unsigned long)s.mul_mat_total.load(),
+        (unsigned long)s.rejected_rank.load(),
+        (unsigned long)s.rejected_batched_off.load(),
+        (unsigned long)s.rejected_min_m.load(),
+        (unsigned long)s.rejected_cbuf.load(),
+        (unsigned long)s.rejected_other.load(),
+        (unsigned long)s.accepted_rank2.load(),
+        (unsigned long)s.accepted_batched.load(),
+        (unsigned long)s.dispatched_static.load(),
+        (unsigned long)s.dispatched_dynamic.load());
 }
 
 // TST.3 / debug override: when RKNPU_FORCE_DYNAMIC_B=1, graph_compute
@@ -610,6 +654,9 @@ static const char * ggml_backend_rknpu_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rknpu_free(ggml_backend_t backend) {
+    // F8.5 route counter dump: print one summary per backend lifetime so
+    // benches/PPL runs can verify what actually ran on the NPU vs CPU.
+    rknpu_print_route_stats("backend_free");
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
     delete ctx;
     delete backend;
@@ -765,6 +812,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             }
         }
         const bool use_static_path = src0_is_pre_quantized && !rknpu_force_dynamic_b();
+
+        // F8.5 route counter: which path actually ran the matmul on the NPU.
+        if (use_static_path) {
+            rknpu_route_stats().dispatched_static.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            rknpu_route_stats().dispatched_dynamic.fetch_add(1, std::memory_order_relaxed);
+        }
 
         const size_t src1_head_stride = (n_heads > 1) ? (src1->nb[2] / sizeof(float)) : 0;
         const size_t dst_head_stride  = (n_heads > 1) ? (dst->nb[2]  / sizeof(float)) : 0;
@@ -1728,6 +1782,8 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // Weights / runtime B
             const struct ggml_tensor * src1 = op->src[1]; // Activations
+            auto& stats = rknpu_route_stats();
+            stats.mul_mat_total.fetch_add(1, std::memory_order_relaxed);
 
             // src0 is always rank-2 here. src1 / op may be rank-3 (broadcast
             // over n_head_q) when F8.3 is enabled. ne[3] must always be 1.
@@ -1740,6 +1796,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                 if (rknpu_batched_diag_enabled()) {
                     rknpu_log_batched_shape_once(src0, src1, op);
                 }
+                stats.rejected_rank.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
@@ -1748,10 +1805,12 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                     if (rknpu_batched_diag_enabled()) {
                         rknpu_log_batched_shape_once(src0, src1, op);
                     }
+                    stats.rejected_batched_off.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
                 // dst's head dim must match src1's; we slice both by nb[2].
                 if (op->ne[2] != src1->ne[2]) {
+                    stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
                 // F8.6a: gate small-M (decode) shapes off the NPU. Per-call
@@ -1762,6 +1821,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                     if (rknpu_batched_diag_enabled()) {
                         rknpu_log_batched_shape_once(src0, src1, op);
                     }
+                    stats.rejected_min_m.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
 
@@ -1779,6 +1839,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                         if (rknpu_batched_diag_enabled()) {
                             rknpu_log_batched_shape_once(src0, src1, op);
                         }
+                        stats.rejected_cbuf.fetch_add(1, std::memory_order_relaxed);
                         return false;
                     }
                 }
@@ -1787,51 +1848,65 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Rejecting zero-dimension ops
             if (src0->ne[0] == 0 || src0->ne[1] == 0 ||
                 src1->ne[0] == 0 || src1->ne[1] == 0) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking if activation type matches the supported operation
             if (src1->type != GGML_TYPE_F32) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for K alignment
             if (src0->ne[0] % pipeline->k_align != 0) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for N alignment
             if (src0->ne[1] % pipeline->n_align != 0) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for exact dimensions
             if (src1->ne[0] != src0->ne[0]) {
-                 return false;
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
+                return false;
             }
 
             // src0 must be contiguous (we read it row-major in dequantize_row).
             // For batched src1 we only require contiguous rows so permuted
             // attention Q (post permute(0,2,1,3)) is acceptable.
             if (!ggml_is_contiguous(src0)) {
+                stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             if (batched_shape) {
                 if (!ggml_is_contiguous_rows(src1)) {
+                    stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
             } else {
                 if (!ggml_is_contiguous(src1)) {
+                    stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
             }
 
+            if (batched_shape) {
+                stats.accepted_batched.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats.accepted_rank2.fetch_add(1, std::memory_order_relaxed);
+            }
             return true;
         }
         default:
