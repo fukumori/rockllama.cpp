@@ -69,6 +69,10 @@ struct RknpuRouteStats {
     std::atomic<uint64_t> accepted_batched{0};
     std::atomic<uint64_t> dispatched_static{0};
     std::atomic<uint64_t> dispatched_dynamic{0};
+    std::atomic<uint64_t> set_tensor_calls{0};
+    std::atomic<uint64_t> set_tensor_first_pipelined{0};   // first set_tensor on a pipelined alloc
+    std::atomic<uint64_t> set_tensor_repeat_pipelined{0};  // subsequent calls (demote path)
+    std::atomic<uint64_t> set_tensor_no_pipeline{0};       // memcpy fallback
 };
 
 static RknpuRouteStats& rknpu_route_stats() {
@@ -82,7 +86,8 @@ static void rknpu_print_route_stats(const char* label) {
         "RKNPU_ROUTE_STATS %s: mul_mat_total=%lu "
         "rejected_rank=%lu rejected_batched_off=%lu rejected_min_m=%lu rejected_cbuf=%lu rejected_other=%lu "
         "accepted_rank2=%lu accepted_batched=%lu "
-        "dispatched_static=%lu dispatched_dynamic=%lu\n",
+        "dispatched_static=%lu dispatched_dynamic=%lu "
+        "set_tensor_calls=%lu set_tensor_first_pipelined=%lu set_tensor_repeat_pipelined=%lu set_tensor_no_pipeline=%lu\n",
         label,
         (unsigned long)s.mul_mat_total.load(),
         (unsigned long)s.rejected_rank.load(),
@@ -93,7 +98,11 @@ static void rknpu_print_route_stats(const char* label) {
         (unsigned long)s.accepted_rank2.load(),
         (unsigned long)s.accepted_batched.load(),
         (unsigned long)s.dispatched_static.load(),
-        (unsigned long)s.dispatched_dynamic.load());
+        (unsigned long)s.dispatched_dynamic.load(),
+        (unsigned long)s.set_tensor_calls.load(),
+        (unsigned long)s.set_tensor_first_pipelined.load(),
+        (unsigned long)s.set_tensor_repeat_pipelined.load(),
+        (unsigned long)s.set_tensor_no_pipeline.load());
 }
 
 // TST.3 / debug override: when RKNPU_FORCE_DYNAMIC_B=1, graph_compute
@@ -662,6 +671,34 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// F8.5.STAT — debug helper to inspect per-buffer set_count distribution at
+// buffer free time. Shows how many tensors went through set_tensor>=2
+// times (the demote path), and the max observed count. Helps locate why
+// dispatched_dynamic stays 0 in production despite accepted_batched > 0.
+static void rknpu_log_buffer_set_count_histogram(const ggml_backend_rknpu_buffer_context* ctx, const char* label) {
+    if (!ctx) return;
+    int total_allocs = 0;
+    int set_count_zero = 0;
+    int set_count_one = 0;
+    int set_count_ge_two = 0;
+    int max_set_count = 0;
+    int pre_quantized = 0;
+    for (const auto& pair : ctx->tensor_allocs) {
+        ++total_allocs;
+        const int sc = pair.second.set_count;
+        if (sc == 0) ++set_count_zero;
+        else if (sc == 1) ++set_count_one;
+        else ++set_count_ge_two;
+        if (sc > max_set_count) max_set_count = sc;
+        if (pair.second.pre_quantized) ++pre_quantized;
+    }
+    std::fprintf(stderr,
+        "RKNPU_BUFFER_FREE %s: name=%s allocs=%d set_count{0=%d, 1=%d, >=2=%d} max=%d pre_quantized_now=%d\n",
+        label,
+        ctx->name.c_str(),
+        total_allocs, set_count_zero, set_count_one, set_count_ge_two, max_set_count, pre_quantized);
+}
+
 // Function for acquiring a pointer for tensor data
 static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     if (!tensor || !tensor->data) return nullptr;
@@ -970,15 +1007,18 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 static std::mutex m;
                 static std::unordered_set<std::string> seen;
                 char key[512];
+                const char* buf_name = (src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name)
+                    ? src0->buffer->buft->iface.get_name(src0->buffer->buft) : "?";
                 std::snprintf(key, sizeof(key),
-                    "ROUTED static=%d M=%d K=%d N=%d n_heads=%d M_total=%d src0=%s/%s/op=%d/view_src=%p/flags=0x%x src1=%s dst=%s op=%s",
-                    use_static_path ? 1 : 0, M, K, N, n_heads, M_total,
+                    "ROUTED static=%d in_rknpu=%d pre_q=%d M=%d K=%d N=%d n_heads=%d M_total=%d src0=%s/%s/buft=%s/op=%d/view_src=%p/flags=0x%x dst=%s op=%s",
+                    use_static_path ? 1 : 0, is_rknpu_buffer(src0) ? 1 : 0, src0_is_pre_quantized ? 1 : 0,
+                    M, K, N, n_heads, M_total,
                     ggml_type_name(src0->type),
                     src0->name[0] ? src0->name : "?",
+                    buf_name,
                     (int)src0->op,
                     (void*)src0->view_src,
                     (unsigned)src0->flags,
-                    ggml_type_name(src1->type),
                     ggml_type_name(dst->type),
                     node->name[0] ? node->name : "?");
                 std::lock_guard<std::mutex> lock(m);
@@ -1215,6 +1255,10 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
 
 static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+
+    if (rknpu_batched_diag_enabled()) {
+        rknpu_log_buffer_set_count_histogram(ctx, "free_buffer");
+    }
 
     // Freeing an every individual RKNN buffer using the allocator context
     for (auto& pair : ctx->tensor_allocs) {
@@ -1526,6 +1570,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
 
+    rknpu_route_stats().set_tensor_calls.fetch_add(1, std::memory_order_relaxed);
+
     // F8.3: pre-quantize only the FIRST set_tensor call against an alloc.
     // Real weights see exactly one such call at model load. Scheduler-managed
     // copy tensors (the F16 KV-cache slices ggml_backend_sched dups into the
@@ -1544,10 +1590,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         const int prev_count = it->second.set_count++;
         if (prev_count == 0) {
             is_first_call = true;
+            rknpu_route_stats().set_tensor_first_pipelined.fetch_add(1, std::memory_order_relaxed);
         } else {
             is_repeat_call = true;
             it->second.pre_quantized = false;
+            rknpu_route_stats().set_tensor_repeat_pipelined.fetch_add(1, std::memory_order_relaxed);
         }
+    } else {
+        rknpu_route_stats().set_tensor_no_pipeline.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (pipeline && is_first_call) {
