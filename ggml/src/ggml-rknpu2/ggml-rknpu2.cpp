@@ -1901,22 +1901,33 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                     return false;
                 }
 
-                // F8.6b stability cap: F8.6b's flatten asks the NPU for one
-                // matmul of M_total = M * n_heads rows. CBUF can't hold A
-                // larger than max_m rows for the given K, and the librknnrt
-                // 2.3.2 driver crashes silently past that. Reject the op so
-                // it falls back to CPU; F8.6c will replace this with M-tiling.
-                const auto* pipe_for_cap = config.resolve_op_support(src0);
-                if (pipe_for_cap) {
-                    const int K_seg_worst = (int)src0->ne[0];
-                    const int max_m = rknpu_max_m_for_cbuf(pipe_for_cap, K_seg_worst);
-                    const int64_t M_total = src1->ne[1] * src1->ne[2];
-                    if (M_total > max_m) {
-                        if (rknpu_batched_diag_enabled()) {
-                            rknpu_log_batched_shape_once(src0, src1, op);
+                // F8.6b CBUF cap experiment outcome: with the F8.5.CLEAN
+                // teardown fix, the original "crashing" shape
+                // (M_total=2048, K=512, FP16) runs cleanly on librknnrt
+                // 2.3.2. The crash was the destructor bug, NOT a hardware
+                // capacity wall. allbilly/npu's CBUF formula applies to
+                // their pure-C driver, not to librknnrt.
+                // Cap is now OPT-IN via RKNPU_BATCHED_MM_ENABLE_CBUF_CAP=1
+                // to keep the diagnostic available, but default OFF — let
+                // librknnrt decide. F8.6e (M-tile) becomes a perf knob
+                // instead of a stability requirement.
+                static const bool enable_cbuf_cap = []() {
+                    const char* v = std::getenv("RKNPU_BATCHED_MM_ENABLE_CBUF_CAP");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                if (enable_cbuf_cap) {
+                    const auto* pipe_for_cap = config.resolve_op_support(src0);
+                    if (pipe_for_cap) {
+                        const int K_seg_worst = (int)src0->ne[0];
+                        const int max_m = rknpu_max_m_for_cbuf(pipe_for_cap, K_seg_worst);
+                        const int64_t M_total = src1->ne[1] * src1->ne[2];
+                        if (M_total > max_m) {
+                            if (rknpu_batched_diag_enabled()) {
+                                rknpu_log_batched_shape_once(src0, src1, op);
+                            }
+                            stats.rejected_cbuf.fetch_add(1, std::memory_order_relaxed);
+                            return false;
                         }
-                        stats.rejected_cbuf.fetch_add(1, std::memory_order_relaxed);
-                        return false;
                     }
                 }
             }
