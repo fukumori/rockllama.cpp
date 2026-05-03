@@ -859,11 +859,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
             auto it = src0_buf_ctx->tensor_allocs.find(tensor_offset_in_virtual);
-            if (it != src0_buf_ctx->tensor_allocs.end() && it->second.pre_quantized) {
-                src0_is_pre_quantized = true;
+            if (it != src0_buf_ctx->tensor_allocs.end()) {
+                b_domain_id = it->second.iommu_domain_id;
+                src0_is_pre_quantized = it->second.pre_quantized;
                 tensor_fd = it->second.mem->fd;
                 tensor_virt_addr = it->second.mem->virt_addr;
-                b_domain_id = it->second.iommu_domain_id;
             }
         }
         const bool use_static_path = src0_is_pre_quantized && !rknpu_force_dynamic_b();
@@ -978,7 +978,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // pre-quantized weight. Reuse a shape-keyed matmul ctx
                         // and a shape-keyed DMA buffer, but re-fill the B
                         // contents and re-bind every call.
-                        const int32_t domain_id = 0;
+                        const int32_t domain_id = b_domain_id;
 
                         matmul_ctxs[idx] = backend_ctx->get_dynamic_matmul_ctx(
                             M_op, K_seg_op, n_seg.size_n,
@@ -1590,15 +1590,17 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     rknpu_route_stats().set_tensor_calls.fetch_add(1, std::memory_order_relaxed);
 
-    // F8.3: pre-quantize only the FIRST set_tensor call against an alloc.
+    // F8.3: pre-quantize only the first full set_tensor call against an alloc.
     // Real weights see exactly one such call at model load. Scheduler-managed
     // copy tensors (the F16 KV-cache slices ggml_backend_sched dups into the
     // RKNPU buffer for batched attention) see a fresh set_tensor every step —
     // demote those to memcpy so graph_compute reads fresh values via the
-    // dynamic path. INPUT/OUTPUT flags are unreliable (the sched only sets
-    // them when n_copies > 1; default n_copies is 1), so we count the calls.
+    // dynamic path. Partial writes are also memcpy-only: pre-quantizing the
+    // whole tensor from a partial source buffer would read beyond the source.
+    // INPUT/OUTPUT flags are unreliable (the sched only sets them when
+    // n_copies > 1; default n_copies is 1), so we count the calls.
     bool is_first_call = false;
-    bool is_repeat_call = false;
+    const bool is_full_tensor_set = (offset == 0 && size == ggml_nbytes(tensor));
     if (pipeline) {
         size_t required_size = get_tensor_packed_size(tensor);
         ctx->get_tensor_allocation(tensor_offset_in_virtual, required_size);
@@ -1606,11 +1608,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
         GGML_ASSERT(it != ctx->tensor_allocs.end());
         const int prev_count = it->second.set_count++;
-        if (prev_count == 0) {
+        if (prev_count == 0 && is_full_tensor_set) {
             is_first_call = true;
             rknpu_route_stats().set_tensor_first_pipelined.fetch_add(1, std::memory_order_relaxed);
         } else {
-            is_repeat_call = true;
             it->second.pre_quantized = false;
             rknpu_route_stats().set_tensor_repeat_pipelined.fetch_add(1, std::memory_order_relaxed);
         }
