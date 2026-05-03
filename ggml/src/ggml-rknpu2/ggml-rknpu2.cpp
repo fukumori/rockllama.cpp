@@ -667,6 +667,24 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     // benches/PPL runs can verify what actually ran on the NPU vs CPU.
     rknpu_print_route_stats("backend_free");
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
+
+    // Cleanup ordering fix: a/c/b buffer caches all hold shared_ptr<rknn_tensor_mem>
+    // whose deleters captured the rknn_matmul_ctx handle that allocated each mem.
+    // The handles must still be valid when the deleters fire. With both static
+    // and dynamic paths populating c_buffer_cache and a_buffer_cache, those
+    // caches contain mems whose captured handle came from EITHER matmul_ctx_cache
+    // OR dynamic_matmul_ctx_cache. Destroying ctx caches first leaves stale
+    // handles in the buffer caches, which segfaults inside rknn_destroy_mem.
+    // Solution: clear ALL buffer caches before ANY ctx cache.
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->b_dynamic_buffer_cache.clear();
+        ctx->c_buffer_cache.clear();
+        ctx->a_buffer_cache.clear();
+        ctx->dynamic_matmul_ctx_cache.clear();
+        ctx->matmul_ctx_cache.clear();
+    }
+
     delete ctx;
     delete backend;
 }
