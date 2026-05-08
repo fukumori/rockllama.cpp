@@ -1242,6 +1242,12 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
 
+        // Tensor too small for NPU alignment (e.g. LoRA adapter rank < n_align):
+        // signal "no pack" via 0 so callers fall back to plain memory.
+        if (K % pipeline->k_align != 0 || N % pipeline->n_align != 0) {
+            return 0;
+        }
+
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
 
         int k_limit = config.max_k_limit;
@@ -1304,13 +1310,16 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
 
-    // Initialize tensor only if it is supported by the pipeline. The DMA
-    // buffer is owned by the alloc; whether it actually holds pre-quantized
-    // bytes is decided in set_tensor (first call only).
+    // Initialize tensor only if it is supported by the pipeline and large
+    // enough for NPU alignment. The DMA buffer is owned by the alloc; whether
+    // it actually holds pre-quantized bytes is decided in set_tensor (first
+    // call only).
     if (pipeline) {
-        size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
         size_t size = get_tensor_packed_size(tensor);
-        ctx->get_tensor_allocation(offset, size);
+        if (size > 0) {
+            size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
+            ctx->get_tensor_allocation(offset, size);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1599,11 +1608,16 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     // whole tensor from a partial source buffer would read beyond the source.
     // INPUT/OUTPUT flags are unreliable (the sched only sets them when
     // n_copies > 1; default n_copies is 1), so we count the calls.
+    // Tensors too small for NPU alignment (e.g. LoRA rank<n_align) get
+    // packed_size==0; treat them like the no-pipeline case so we never call
+    // rknn_create_mem(...,0) and the data path is plain memcpy.
+    const size_t pipeline_packed_size = pipeline ? get_tensor_packed_size(tensor) : 0;
+    const bool small_for_npu = pipeline && pipeline_packed_size == 0;
+
     bool is_first_call = false;
     const bool is_full_tensor_set = (offset == 0 && size == ggml_nbytes(tensor));
-    if (pipeline) {
-        size_t required_size = get_tensor_packed_size(tensor);
-        ctx->get_tensor_allocation(tensor_offset_in_virtual, required_size);
+    if (pipeline && !small_for_npu) {
+        ctx->get_tensor_allocation(tensor_offset_in_virtual, pipeline_packed_size);
         std::lock_guard<std::mutex> lock(ctx->mutex);
         auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
         GGML_ASSERT(it != ctx->tensor_allocs.end());
@@ -1617,6 +1631,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         }
     } else {
         rknpu_route_stats().set_tensor_no_pipeline.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (small_for_npu) {
+        memcpy((uint8_t*)tensor->data + offset, data, size);
+        return;
     }
 
     if (pipeline && is_first_call) {
@@ -1644,8 +1663,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
         }
 
-        // Allocating a new buffer for a tensor
-        size_t required_size = get_tensor_packed_size(tensor);
+        // Allocating a new buffer for a tensor (small_for_npu was filtered above)
+        const size_t required_size = pipeline_packed_size;
         auto alloc = ctx->get_tensor_allocation(tensor_offset_in_virtual, required_size);
         uint8_t* tensor_dma_ptr = (uint8_t*)alloc.mem->virt_addr;
 
