@@ -2,7 +2,7 @@ name: Sync Check
 
 on:
   schedule:
-    - cron: '0 6 * * 1'   # toda segunda-feira às 6h UTC
+    - cron: '0 6 * * *'   # diariamente às 6h UTC (cobre fim de semana)
   workflow_dispatch:       # permite execução manual
 
 jobs:
@@ -44,12 +44,15 @@ jobs:
         run: |
           git config user.email "ci@rockllama"
           git config user.name "CI Bot"
+          # patches/ vive no master do fork; preserva antes do checkout para upstream
+          PATCH_DIR=$(mktemp -d)
+          cp patches/*.patch "$PATCH_DIR/"
           git checkout -b ci/patch-test-${{ github.run_id }} upstream/master
           FAIL=0
-          for patch in patches/*.patch; do
-            echo "Testando: $patch"
+          for patch in "$PATCH_DIR"/*.patch; do
+            echo "Testando: $(basename "$patch")"
             if ! git am "$patch" 2>&1; then
-              echo "::error::Patch falhou: $patch"
+              echo "::error::Patch falhou: $(basename "$patch")"
               git am --abort 2>/dev/null || true
               FAIL=1
               break
