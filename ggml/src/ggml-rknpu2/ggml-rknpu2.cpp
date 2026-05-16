@@ -1540,13 +1540,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 // ctx_hits / b_hits / iter_t_sync_b were the three placeholder
                 // gaps flagged by Codex review on 2026-05-16 and are now
                 // populated; see audit log entry of the same date.
+                // Section 1 (Preparing Contexts) runs from t1_start to t2_start
+                // and includes the dynamic-B rknn_mem_sync(TO_DEVICE) call. So
+                // iter_t_setup already accounts for iter_t_sync_b in the dynamic
+                // path; subtract before emit so t_total_us = sum(six buckets)
+                // does not double-count. In the static path iter_t_sync_b is
+                // always 0 and this is a no-op. Caught by Codex review on
+                // 2026-05-16; see audit log of the same date.
+                const int64_t emit_t_setup = iter_t_setup - iter_t_sync_b;
                 rknpu_profile_writer().emit(
                     (uint64_t)call_count, node_i, kind, strategy,
                     M_op, K_seg_op, /*N_total_active=*/N,
                     type_label, (int)num_active_segments,
                     /*ac_native=*/0, /*b_native=*/1,
                     iter_ctx_hits, iter_b_hits,
-                    iter_t_setup, iter_t_prepA, iter_t_prepC,
+                    emit_t_setup, iter_t_prepA, iter_t_prepC,
                     iter_t_npu, iter_t_sync_b, iter_t_sync_c, iter_t_gather);
             }
         }
