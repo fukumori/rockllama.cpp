@@ -120,29 +120,32 @@ struct RknpuProfileWriter {
     }
     // emit one JSONL record. All ints/strings escaped trivially because
     // values are bounded (numbers + a few constant labels).
+    // Semantics: ctx_hits is the count of get_*_ctx cache hits in this
+    // iteration (max = cores). b_hits is the same for the dynamic-B
+    // tensor_buffer cache and is always 0 in the static path.
     void emit(
         uint64_t iter, int node, const char* kind, const char* strategy,
         int M, int K, int N, const char* type_label, int cores,
-        int ac_native, int b_native, int ctx_hit, int b_hit,
+        int ac_native, int b_native, int ctx_hits, int b_hits,
         int64_t t_setup_us, int64_t t_prepA_us, int64_t t_prepC_us,
-        int64_t t_run_us, int64_t t_sync_c_us, int64_t t_gather_us
+        int64_t t_run_us, int64_t t_sync_b_us, int64_t t_sync_c_us, int64_t t_gather_us
     ) {
         std::lock_guard<std::mutex> lock(mtx);
         FILE* f = file_lazy();
         if (f == nullptr) return;
-        const int64_t t_total_us = t_setup_us + t_prepA_us + t_prepC_us + t_run_us + t_sync_c_us + t_gather_us;
+        const int64_t t_total_us = t_setup_us + t_prepA_us + t_prepC_us + t_run_us + t_sync_b_us + t_sync_c_us + t_gather_us;
         std::fprintf(f,
             "{\"iter\":%lu,\"node\":%d,\"kind\":\"%s\",\"strategy\":\"%s\","
             "\"M\":%d,\"K\":%d,\"N\":%d,\"type\":\"%s\",\"cores\":%d,"
-            "\"ac_native\":%d,\"b_native\":%d,\"ctx_hit\":%d,\"b_hit\":%d,"
+            "\"ac_native\":%d,\"b_native\":%d,\"ctx_hits\":%d,\"b_hits\":%d,"
             "\"t_setup_us\":%lld,\"t_prepA_us\":%lld,\"t_prepC_us\":%lld,"
-            "\"t_run_us\":%lld,\"t_sync_c_us\":%lld,\"t_gather_us\":%lld,"
+            "\"t_run_us\":%lld,\"t_sync_b_us\":%lld,\"t_sync_c_us\":%lld,\"t_gather_us\":%lld,"
             "\"t_total_us\":%lld}\n",
             (unsigned long)iter, node, kind, strategy,
             M, K, N, type_label, cores,
-            ac_native, b_native, ctx_hit, b_hit,
+            ac_native, b_native, ctx_hits, b_hits,
             (long long)t_setup_us, (long long)t_prepA_us, (long long)t_prepC_us,
-            (long long)t_run_us, (long long)t_sync_c_us, (long long)t_gather_us,
+            (long long)t_run_us, (long long)t_sync_b_us, (long long)t_sync_c_us, (long long)t_gather_us,
             (long long)t_total_us);
         ++records_written;
     }
@@ -704,15 +707,17 @@ struct ggml_backend_rknpu_context {
     // F8.2 dynamic-B path: per-shape DMA buffer cache for B (re-quantized in-place per call).
     std::unordered_map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> b_dynamic_buffer_cache;
 
-    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
+    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id, bool* out_was_hit = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
 
         auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id);
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
             rknpu_route_stats().ctx_reuse_count.fetch_add(1, std::memory_order_relaxed);
+            if (out_was_hit) *out_was_hit = true;
             return it->second;
         }
+        if (out_was_hit) *out_was_hit = false;
 
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
         if (ctx->ctx == 0) {
@@ -749,15 +754,17 @@ struct ggml_backend_rknpu_context {
     // F8.2 dynamic-B variant of get_matmul_ctx. Same RKNN ctx setup as the
     // static path, but cached purely by shape so different src0 tensors that
     // share the same (M, K, N, core, type, domain) reuse the same context.
-    std::shared_ptr<rknpu_matmul_context> get_dynamic_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
+    std::shared_ptr<rknpu_matmul_context> get_dynamic_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id, bool* out_was_hit = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
 
         auto key = std::make_tuple(M, K, N, core_id, (int)type, (int)domain_id);
         auto it = dynamic_matmul_ctx_cache.find(key);
         if (it != dynamic_matmul_ctx_cache.end()) {
             rknpu_route_stats().ctx_reuse_count.fetch_add(1, std::memory_order_relaxed);
+            if (out_was_hit) *out_was_hit = true;
             return it->second;
         }
+        if (out_was_hit) *out_was_hit = false;
 
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
         if (ctx->ctx == 0) {
@@ -915,16 +922,19 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     rknn_matmul_ctx matmul_ctx,
     size_t size,
     const CacheKeyType& key,
-    std::unordered_map<CacheKeyType, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
+    std::unordered_map<CacheKeyType, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache,
+    bool* out_was_hit = nullptr
 ) {
     std::lock_guard<std::mutex> lock(backend_ctx->mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
         if (it->second->size >= size) {
             rknpu_route_stats().tensor_buffer_reuse_count.fetch_add(1, std::memory_order_relaxed);
+            if (out_was_hit) *out_was_hit = true;
             return it->second;
         }
     }
+    if (out_was_hit) *out_was_hit = false;
 
     rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
     if (!mem) { return nullptr; }
@@ -1125,6 +1135,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             const auto& k_seg = all_k_segments[k_idx];
             const int K_seg_op = k_seg.size_k;
 
+            // Phase 1.C follow-up: per-iteration hit counters + sync_b timer.
+            // ctx_hits counts cache hits in get_matmul_ctx + get_dynamic_matmul_ctx
+            // across all (n_seg, segment) pairs. b_hits counts hits in
+            // get_tensor_buffer for B specifically (dynamic path only; static
+            // path binds B once via rknn_create_mem_from_fd and stays at 0).
+            // iter_t_sync_b accumulates rknn_mem_sync(B, TO_DEVICE) for the
+            // dynamic path; static path leaves it at 0.
+            int iter_ctx_hits = 0;
+            int iter_b_hits = 0;
+            int64_t iter_t_sync_b = 0;
+
             // ===========================================
             // ========== 1. Preparing Contexts ==========
             // ===========================================
@@ -1140,10 +1161,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // tensor blob; bind once via create_mem_from_fd.
                         size_t offset_in_dma = current_offset_in_tensor;
 
+                        bool ctx_hit_local = false;
                         matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
                             (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
-                            n_seg.core_id, matmul_type, b_domain_id
+                            n_seg.core_id, matmul_type, b_domain_id, &ctx_hit_local
                         );
+                        if (ctx_hit_local) iter_ctx_hits++;
                         if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
 
                         auto& matmul_ctx = matmul_ctxs[idx];
@@ -1175,21 +1198,25 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // contents and re-bind every call.
                         const int32_t domain_id = b_domain_id;
 
+                        bool ctx_hit_local = false;
                         matmul_ctxs[idx] = backend_ctx->get_dynamic_matmul_ctx(
                             M_op, K_seg_op, n_seg.size_n,
-                            n_seg.core_id, matmul_type, domain_id
+                            n_seg.core_id, matmul_type, domain_id, &ctx_hit_local
                         );
                         if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
+                        if (ctx_hit_local) iter_ctx_hits++;
 
                         auto& matmul_ctx = matmul_ctxs[idx];
 
                         auto b_key = std::make_tuple(
                             M_op, K_seg_op, n_seg.size_n, n_seg.core_id,
                             (int)pipeline->npu_type_b, (int)domain_id);
+                        bool b_hit_local = false;
                         auto mem_B = get_tensor_buffer(
                             backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.B.size,
-                            b_key, backend_ctx->b_dynamic_buffer_cache);
+                            b_key, backend_ctx->b_dynamic_buffer_cache, &b_hit_local);
                         if (!mem_B) return GGML_STATUS_FAILED;
+                        if (b_hit_local) iter_b_hits++;
                         matmul_ctx->mem_B = mem_B;
 
                         const float * s_vec_ptr = is_hadamard ? s_vec.data() : nullptr;
@@ -1202,7 +1229,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         scales_B_grid[k_idx * num_active_segments + idx] = block_scale;
 
                         RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B dynamic");
+                        // Phase 1.C follow-up: time sync_b separately so JSONL
+                        // shows the dynamic-B per-iter TO_DEVICE cost. Static
+                        // path never reaches here and keeps iter_t_sync_b=0.
+                        std::chrono::high_resolution_clock::time_point t_sync_b_start;
+                        if (_timer_active) t_sync_b_start = std::chrono::high_resolution_clock::now();
                         RKNN_CHECK(rknn_mem_sync(matmul_ctx->ctx, mem_B.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync B dynamic TO_DEVICE");
+                        if (_timer_active) {
+                            auto t_sync_b_end = std::chrono::high_resolution_clock::now();
+                            iter_t_sync_b += std::chrono::duration_cast<std::chrono::microseconds>(t_sync_b_end - t_sync_b_start).count();
+                        }
                     }
                     break;
                 }
@@ -1501,14 +1537,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 // exposing them per-record makes the Fase 6 J experiment
                 // ("AC_layout=1 cost/benefit") trivial to grep for in the
                 // resulting JSONL.
+                // ctx_hits / b_hits / iter_t_sync_b were the three placeholder
+                // gaps flagged by Codex review on 2026-05-16 and are now
+                // populated; see audit log entry of the same date.
                 rknpu_profile_writer().emit(
                     (uint64_t)call_count, node_i, kind, strategy,
                     M_op, K_seg_op, /*N_total_active=*/N,
                     type_label, (int)num_active_segments,
                     /*ac_native=*/0, /*b_native=*/1,
-                    /*ctx_hit=*/-1,  /*b_hit=*/-1,  // per-record hit/miss tracking deferred to follow-up; global counts in RKNPU_ROUTE_STATS
+                    iter_ctx_hits, iter_b_hits,
                     iter_t_setup, iter_t_prepA, iter_t_prepC,
-                    iter_t_npu, iter_t_sync_c, iter_t_gather);
+                    iter_t_npu, iter_t_sync_b, iter_t_sync_c, iter_t_gather);
             }
         }
     }
