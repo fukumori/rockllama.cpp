@@ -101,9 +101,17 @@ struct RknpuProfileWriter {
         if (open_failed) return nullptr;
         const char* path = rknpu_profile_csv_path();
         if (path == nullptr) { open_failed = true; return nullptr; }
-        fp = std::fopen(path, "w");
+        // First open in this process truncates ("w"), subsequent opens
+        // (e.g. when llama-bench tears down and re-creates the backend
+        // between pp512 and tg128) append ("a") so the artefact contains
+        // records from every backend lifetime of the same run. Without
+        // this, the second backend would overwrite the first one's data.
+        static bool first_open = true;
+        const char* mode = first_open ? "w" : "a";
+        first_open = false;
+        fp = std::fopen(path, mode);
         if (fp == nullptr) {
-            std::fprintf(stderr, "RKNPU_PROFILE_CSV: failed to open %s (errno=%d), disabling\n", path, errno);
+            std::fprintf(stderr, "RKNPU_PROFILE_CSV: failed to open %s mode=%s (errno=%d), disabling\n", path, mode, errno);
             open_failed = true;
             return nullptr;
         }
