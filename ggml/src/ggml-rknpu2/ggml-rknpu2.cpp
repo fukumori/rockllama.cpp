@@ -27,13 +27,12 @@
 #include <sys/resource.h>
 #include <sstream>
 #include <cstdio>
+#include <cerrno>
 #include <unordered_set>
 #include <atomic>
 #include <cstdint>
 
-#ifdef GGML_RKNPU2_DEBUG
 #include <chrono>
-#endif
 
 #define UNUSED(x) (void)(x)
 
@@ -73,6 +72,85 @@ static bool rknpu_audit_multi_ctx_enabled() {
     return enabled;
 }
 
+// Phase 1.C item 9.4: RKNPU_PROFILE_CSV=/path/to/file.jsonl writes one JSON
+// line per (k_seg, n_seg) iteration with timers, shape, strategy. Default
+// off; when empty/unset, the path-cached lookup returns false and the
+// emitter is skipped (~one cached bool load per iter). Active calls share a
+// single FILE* protected by a mutex — graph_compute is serial within a
+// process today, mutex is defensive.
+static const char* rknpu_profile_csv_path() {
+    static const char* path = []() -> const char* {
+        const char* v = std::getenv("RKNPU_PROFILE_CSV");
+        if (v == nullptr || v[0] == '\0') return nullptr;
+        return v;
+    }();
+    return path;
+}
+static bool rknpu_profile_csv_active() {
+    return rknpu_profile_csv_path() != nullptr;
+}
+
+struct RknpuProfileWriter {
+    std::mutex mtx;
+    FILE* fp = nullptr;
+    uint64_t records_written = 0;
+    bool open_failed = false;
+
+    FILE* file_lazy() {
+        if (fp != nullptr) return fp;
+        if (open_failed) return nullptr;
+        const char* path = rknpu_profile_csv_path();
+        if (path == nullptr) { open_failed = true; return nullptr; }
+        fp = std::fopen(path, "w");
+        if (fp == nullptr) {
+            std::fprintf(stderr, "RKNPU_PROFILE_CSV: failed to open %s (errno=%d), disabling\n", path, errno);
+            open_failed = true;
+            return nullptr;
+        }
+        std::setvbuf(fp, nullptr, _IOLBF, 0); // line-buffered so partial logs survive a crash
+        return fp;
+    }
+    // emit one JSONL record. All ints/strings escaped trivially because
+    // values are bounded (numbers + a few constant labels).
+    void emit(
+        uint64_t iter, int node, const char* kind, const char* strategy,
+        int M, int K, int N, const char* type_label, int cores,
+        int ac_native, int b_native, int ctx_hit, int b_hit,
+        int64_t t_setup_us, int64_t t_prepA_us, int64_t t_prepC_us,
+        int64_t t_run_us, int64_t t_sync_c_us, int64_t t_gather_us
+    ) {
+        std::lock_guard<std::mutex> lock(mtx);
+        FILE* f = file_lazy();
+        if (f == nullptr) return;
+        const int64_t t_total_us = t_setup_us + t_prepA_us + t_prepC_us + t_run_us + t_sync_c_us + t_gather_us;
+        std::fprintf(f,
+            "{\"iter\":%lu,\"node\":%d,\"kind\":\"%s\",\"strategy\":\"%s\","
+            "\"M\":%d,\"K\":%d,\"N\":%d,\"type\":\"%s\",\"cores\":%d,"
+            "\"ac_native\":%d,\"b_native\":%d,\"ctx_hit\":%d,\"b_hit\":%d,"
+            "\"t_setup_us\":%lld,\"t_prepA_us\":%lld,\"t_prepC_us\":%lld,"
+            "\"t_run_us\":%lld,\"t_sync_c_us\":%lld,\"t_gather_us\":%lld,"
+            "\"t_total_us\":%lld}\n",
+            (unsigned long)iter, node, kind, strategy,
+            M, K, N, type_label, cores,
+            ac_native, b_native, ctx_hit, b_hit,
+            (long long)t_setup_us, (long long)t_prepA_us, (long long)t_prepC_us,
+            (long long)t_run_us, (long long)t_sync_c_us, (long long)t_gather_us,
+            (long long)t_total_us);
+        ++records_written;
+    }
+    void flush_close() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (fp == nullptr) return;
+        std::fflush(fp);
+        std::fclose(fp);
+        fp = nullptr;
+    }
+};
+static RknpuProfileWriter& rknpu_profile_writer() {
+    static RknpuProfileWriter w;
+    return w;
+}
+
 // F8.5 route counters: per-process atomic stats so any bench / PPL run can
 // answer "where did the batched mul_mat ops actually go?" Used by the codex
 // review criteria. Printed by the backend's free hook (one summary per
@@ -83,7 +161,20 @@ struct RknpuRouteStats {
     std::atomic<uint64_t> rejected_batched_off{0}; // RKNPU_BATCHED_MM_ENABLE=0
     std::atomic<uint64_t> rejected_min_m{0};
     std::atomic<uint64_t> rejected_cbuf{0};
-    std::atomic<uint64_t> rejected_other{0};      // pipeline/align/contig/...
+    std::atomic<uint64_t> rejected_other{0};      // sum of the per-branch buckets below
+    // Phase 1.B item B: rejected_other broken down by branch in
+    // ggml_backend_rknpu_device_supports_op. Invariant:
+    // rejected_other == sum(rejected_broadcast_mismatch ... rejected_contig_src1).
+    std::atomic<uint64_t> rejected_broadcast_mismatch{0}; // batched + op->ne[2] != src1->ne[2]
+    std::atomic<uint64_t> rejected_no_pipeline{0};        // resolve_op_support returned null (incl. unsupported src0 type)
+    std::atomic<uint64_t> rejected_zero_dim{0};           // src0/src1 ne[0] or ne[1] == 0
+    std::atomic<uint64_t> rejected_type_src1{0};          // src1->type != F32
+    std::atomic<uint64_t> rejected_align_k{0};            // src0->ne[0] % k_align != 0
+    std::atomic<uint64_t> rejected_align_n{0};            // src0->ne[1] % n_align != 0
+    std::atomic<uint64_t> rejected_k_mismatch{0};         // src1->ne[0] != src0->ne[0]
+    std::atomic<uint64_t> rejected_contig_src0{0};        // !ggml_is_contiguous(src0)
+    std::atomic<uint64_t> rejected_contig_src1_rows{0};   // batched + !ggml_is_contiguous_rows(src1)
+    std::atomic<uint64_t> rejected_contig_src1{0};        // non-batched + !ggml_is_contiguous(src1)
     std::atomic<uint64_t> accepted_rank2{0};
     std::atomic<uint64_t> accepted_batched{0};
     std::atomic<uint64_t> dispatched_static{0};
@@ -92,6 +183,13 @@ struct RknpuRouteStats {
     std::atomic<uint64_t> set_tensor_first_pipelined{0};   // first set_tensor on a pipelined alloc
     std::atomic<uint64_t> set_tensor_repeat_pipelined{0};  // subsequent calls (demote path)
     std::atomic<uint64_t> set_tensor_no_pipeline{0};       // memcpy fallback
+    // Phase 1.B item 9.3: ctx and tensor-buffer cache hit rates per session.
+    // tensor_buffer_* counts A + B + C buffers combined (get_tensor_buffer is
+    // the generic helper); split-by-kind is deferred to chunk 1.C JSONL.
+    std::atomic<uint64_t> ctx_create_count{0};         // static + dynamic combined ctx allocations
+    std::atomic<uint64_t> ctx_reuse_count{0};          // cache hits in get_matmul_ctx / get_dynamic_matmul_ctx
+    std::atomic<uint64_t> tensor_buffer_pack_count{0}; // get_tensor_buffer miss path (create + bind)
+    std::atomic<uint64_t> tensor_buffer_reuse_count{0}; // get_tensor_buffer hit path
 };
 
 static RknpuRouteStats& rknpu_route_stats() {
@@ -101,19 +199,33 @@ static RknpuRouteStats& rknpu_route_stats() {
 
 static void rknpu_print_route_stats(const char* label) {
     auto& s = rknpu_route_stats();
+    const uint64_t r_brd  = s.rejected_broadcast_mismatch.load();
+    const uint64_t r_pipe = s.rejected_no_pipeline.load();
+    const uint64_t r_zd   = s.rejected_zero_dim.load();
+    const uint64_t r_t1   = s.rejected_type_src1.load();
+    const uint64_t r_ak   = s.rejected_align_k.load();
+    const uint64_t r_an   = s.rejected_align_n.load();
+    const uint64_t r_km   = s.rejected_k_mismatch.load();
+    const uint64_t r_c0   = s.rejected_contig_src0.load();
+    const uint64_t r_c1r  = s.rejected_contig_src1_rows.load();
+    const uint64_t r_c1   = s.rejected_contig_src1.load();
+    const uint64_t r_sum  = r_brd + r_pipe + r_zd + r_t1 + r_ak + r_an + r_km + r_c0 + r_c1r + r_c1;
+    const uint64_t r_other = s.rejected_other.load();
     std::fprintf(stderr,
         "RKNPU_ROUTE_STATS %s: mul_mat_total=%lu "
         "rejected_rank=%lu rejected_batched_off=%lu rejected_min_m=%lu rejected_cbuf=%lu rejected_other=%lu "
         "accepted_rank2=%lu accepted_batched=%lu "
         "dispatched_static=%lu dispatched_dynamic=%lu "
-        "set_tensor_calls=%lu set_tensor_first_pipelined=%lu set_tensor_repeat_pipelined=%lu set_tensor_no_pipeline=%lu\n",
+        "set_tensor_calls=%lu set_tensor_first_pipelined=%lu set_tensor_repeat_pipelined=%lu set_tensor_no_pipeline=%lu "
+        "rejected_buckets=[broadcast=%lu no_pipeline=%lu zero_dim=%lu type_src1=%lu align_k=%lu align_n=%lu k_mismatch=%lu contig_src0=%lu contig_src1_rows=%lu contig_src1=%lu sum=%lu invariant_ok=%d] "
+        "ctx_create=%lu ctx_reuse=%lu tensor_buffer_pack=%lu tensor_buffer_reuse=%lu\n",
         label,
         (unsigned long)s.mul_mat_total.load(),
         (unsigned long)s.rejected_rank.load(),
         (unsigned long)s.rejected_batched_off.load(),
         (unsigned long)s.rejected_min_m.load(),
         (unsigned long)s.rejected_cbuf.load(),
-        (unsigned long)s.rejected_other.load(),
+        (unsigned long)r_other,
         (unsigned long)s.accepted_rank2.load(),
         (unsigned long)s.accepted_batched.load(),
         (unsigned long)s.dispatched_static.load(),
@@ -121,7 +233,15 @@ static void rknpu_print_route_stats(const char* label) {
         (unsigned long)s.set_tensor_calls.load(),
         (unsigned long)s.set_tensor_first_pipelined.load(),
         (unsigned long)s.set_tensor_repeat_pipelined.load(),
-        (unsigned long)s.set_tensor_no_pipeline.load());
+        (unsigned long)s.set_tensor_no_pipeline.load(),
+        (unsigned long)r_brd, (unsigned long)r_pipe, (unsigned long)r_zd,
+        (unsigned long)r_t1, (unsigned long)r_ak, (unsigned long)r_an,
+        (unsigned long)r_km, (unsigned long)r_c0, (unsigned long)r_c1r,
+        (unsigned long)r_c1, (unsigned long)r_sum, (int)(r_sum == r_other),
+        (unsigned long)s.ctx_create_count.load(),
+        (unsigned long)s.ctx_reuse_count.load(),
+        (unsigned long)s.tensor_buffer_pack_count.load(),
+        (unsigned long)s.tensor_buffer_reuse_count.load());
 }
 
 // TST.3 / debug override: when RKNPU_FORCE_DYNAMIC_B=1, graph_compute
@@ -582,6 +702,7 @@ struct ggml_backend_rknpu_context {
         auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id);
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
+            rknpu_route_stats().ctx_reuse_count.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
 
@@ -612,6 +733,7 @@ struct ggml_backend_rknpu_context {
                 (void*)ctx.get(), (unsigned)core_mask, ret);
         }
 
+        rknpu_route_stats().ctx_create_count.fetch_add(1, std::memory_order_relaxed);
         matmul_ctx_cache[key] = ctx;
         return ctx;
     }
@@ -625,6 +747,7 @@ struct ggml_backend_rknpu_context {
         auto key = std::make_tuple(M, K, N, core_id, (int)type, (int)domain_id);
         auto it = dynamic_matmul_ctx_cache.find(key);
         if (it != dynamic_matmul_ctx_cache.end()) {
+            rknpu_route_stats().ctx_reuse_count.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
 
@@ -653,6 +776,7 @@ struct ggml_backend_rknpu_context {
                 (void*)ctx.get(), (unsigned)core_mask, ret);
         }
 
+        rknpu_route_stats().ctx_create_count.fetch_add(1, std::memory_order_relaxed);
         dynamic_matmul_ctx_cache[key] = ctx;
         return ctx;
     }
@@ -701,6 +825,9 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     // F8.5 route counter dump: print one summary per backend lifetime so
     // benches/PPL runs can verify what actually ran on the NPU vs CPU.
     rknpu_print_route_stats("backend_free");
+    // Phase 1.C 9.4: flush any pending RKNPU_PROFILE_CSV records and close
+    // the file. Safe to call even when CSV was never enabled (no-op).
+    rknpu_profile_writer().flush_close();
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
 
     // Cleanup ordering fix: a/c/b buffer caches all hold shared_ptr<rknn_tensor_mem>
@@ -786,6 +913,7 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     auto it = cache.find(key);
     if (it != cache.end()) {
         if (it->second->size >= size) {
+            rknpu_route_stats().tensor_buffer_reuse_count.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
     }
@@ -801,6 +929,7 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
 
     std::shared_ptr<rknn_tensor_mem> mem_shared(mem, deleter);
     cache[key] = mem_shared;
+    rknpu_route_stats().tensor_buffer_pack_count.fetch_add(1, std::memory_order_relaxed);
     return mem_shared;
 }
 
@@ -810,18 +939,26 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     // Getting the current device configuration once
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
 
-#ifdef GGML_RKNPU2_DEBUG
-    // Timing accumulators (us). Phase 1 item G: collect split in sync_c (NPU
-    // dma sync_from_device, serial across cores) and gather (parallel NEON
-    // dequant/scatter over M rows). t_collect kept as the sum for backward
-    // compatibility with the existing 50-call summary.
+    // Phase 1.C: timers are runtime-gated. Active when CSV export is on
+    // or when the debug-build flag is set. When inactive the per-iter
+    // chrono::now() and duration_cast calls are skipped entirely, so
+    // production hot-path cost stays at one cached bool load + branch.
+    // Phase 1 item G: collect split in sync_c (NPU dma sync_from_device,
+    // serial across cores) and gather (parallel NEON dequant/scatter over
+    // M rows). t_collect kept as the sum for backward compatibility.
     static int64_t t_setup = 0, t_prepA = 0, t_prepC = 0, t_npu = 0,
                    t_sync_c = 0, t_gather = 0, t_collect = 0;
     static int call_count = 0;
     int64_t node_t_setup = 0, node_t_prepA = 0, node_t_prepC = 0, node_t_npu = 0,
             node_t_sync_c = 0, node_t_collect = 0;
     // node_t_gather is derived at aggregation: node_t_collect - node_t_sync_c.
+    const bool _profile_csv_active = rknpu_profile_csv_active();
+#ifdef GGML_RKNPU2_DEBUG
+    constexpr bool _profile_debug_build = true;
+#else
+    constexpr bool _profile_debug_build = false;
 #endif
+    const bool _timer_active = _profile_csv_active || _profile_debug_build;
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
@@ -983,9 +1120,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 1. Preparing Contexts ==========
             // ===========================================
-#ifdef GGML_RKNPU2_DEBUG
-            auto t1_start = std::chrono::high_resolution_clock::now();
-#endif
+            std::chrono::high_resolution_clock::time_point t1_start;
+            if (_timer_active) t1_start = std::chrono::high_resolution_clock::now();
             for (const auto& n_seg : all_n_segments) {
                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
                     if (active_n_segments[idx].offset_n != n_seg.offset_n) continue;
@@ -1100,10 +1236,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 2. Preparing A-matrix ==========
             // ===========================================
-#ifdef GGML_RKNPU2_DEBUG
-            auto t2_start = std::chrono::high_resolution_clock::now();
-            node_t_setup += std::chrono::duration_cast<std::chrono::microseconds>(t2_start - t1_start).count();
-#endif
+            std::chrono::high_resolution_clock::time_point t2_start;
+            int64_t iter_t_setup = 0;
+            if (_timer_active) {
+                t2_start = std::chrono::high_resolution_clock::now();
+                iter_t_setup = std::chrono::duration_cast<std::chrono::microseconds>(t2_start - t1_start).count();
+                node_t_setup += iter_t_setup;
+            }
             std::vector<float> scales_A(M_total, 1.0f);
             {
                 auto cache_key = std::make_tuple(M_op, K_seg_op, (int)pipeline->npu_type_a, b_domain_id);
@@ -1174,10 +1313,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 3. Preparing C-matrix ==========
             // ===========================================
-#ifdef GGML_RKNPU2_DEBUG
-            auto t3_start = std::chrono::high_resolution_clock::now();
-            node_t_prepA += std::chrono::duration_cast<std::chrono::microseconds>(t3_start - t2_start).count();
-#endif
+            std::chrono::high_resolution_clock::time_point t3_start;
+            int64_t iter_t_prepA = 0;
+            if (_timer_active) {
+                t3_start = std::chrono::high_resolution_clock::now();
+                iter_t_prepA = std::chrono::duration_cast<std::chrono::microseconds>(t3_start - t2_start).count();
+                node_t_prepA += iter_t_prepA;
+            }
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     auto& matmul_ctx = matmul_ctxs[idx];
@@ -1195,10 +1337,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ==========================================
             // ========== 4. Running operation ==========
             // ==========================================
-#ifdef GGML_RKNPU2_DEBUG
-            auto t4_start = std::chrono::high_resolution_clock::now();
-            node_t_prepC += std::chrono::duration_cast<std::chrono::microseconds>(t4_start - t3_start).count();
-#endif
+            std::chrono::high_resolution_clock::time_point t4_start;
+            int64_t iter_t_prepC = 0;
+            if (_timer_active) {
+                t4_start = std::chrono::high_resolution_clock::now();
+                iter_t_prepC = std::chrono::duration_cast<std::chrono::microseconds>(t4_start - t3_start).count();
+                node_t_prepC += iter_t_prepC;
+            }
             {
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
@@ -1212,19 +1357,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 5. Collecting results ==========
             // ===========================================
-#ifdef GGML_RKNPU2_DEBUG
-            auto t5_start = std::chrono::high_resolution_clock::now();
-            node_t_npu += std::chrono::duration_cast<std::chrono::microseconds>(t5_start - t4_start).count();
-#endif
+            std::chrono::high_resolution_clock::time_point t5_start;
+            int64_t iter_t_npu = 0;
+            if (_timer_active) {
+                t5_start = std::chrono::high_resolution_clock::now();
+                iter_t_npu = std::chrono::duration_cast<std::chrono::microseconds>(t5_start - t4_start).count();
+                node_t_npu += iter_t_npu;
+            }
+            int64_t iter_t_sync_c = 0;
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }
 
-#ifdef GGML_RKNPU2_DEBUG
-                auto t5b_start = std::chrono::high_resolution_clock::now();
-                node_t_sync_c += std::chrono::duration_cast<std::chrono::microseconds>(t5b_start - t5_start).count();
-#endif
+                if (_timer_active) {
+                    auto t5b_start = std::chrono::high_resolution_clock::now();
+                    iter_t_sync_c = std::chrono::duration_cast<std::chrono::microseconds>(t5b_start - t5_start).count();
+                    node_t_sync_c += iter_t_sync_c;
+                }
 
                 const float hadamard_divisor = pipeline->use_hadamard ? (float)K_op : 1.0f;
 
@@ -1324,14 +1474,38 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     }
                 }
             }
-#ifdef GGML_RKNPU2_DEBUG
-            auto t6_start = std::chrono::high_resolution_clock::now();
-            node_t_collect += std::chrono::duration_cast<std::chrono::microseconds>(t6_start - t5_start).count();
-#endif
+            int64_t iter_t_collect = 0;
+            int64_t iter_t_gather = 0;
+            if (_timer_active) {
+                auto t6_start = std::chrono::high_resolution_clock::now();
+                iter_t_collect = std::chrono::duration_cast<std::chrono::microseconds>(t6_start - t5_start).count();
+                iter_t_gather = iter_t_collect - iter_t_sync_c;
+                node_t_collect += iter_t_collect;
+            }
+
+            // Phase 1.C 9.4: per-iteration JSONL record.
+            if (_profile_csv_active) {
+                const char* kind = (n_heads > 1) ? "batched" : "rank2";
+                const char* strategy = use_static_path ? "static" : "dynamic";
+                const char* type_label = pipeline->pipeline_name.c_str();
+                // ac_native and b_native are hardcoded in this backend
+                // (init_matmul_info forces AC_layout=NORM, B_layout=NATIVE);
+                // exposing them per-record makes the Fase 6 J experiment
+                // ("AC_layout=1 cost/benefit") trivial to grep for in the
+                // resulting JSONL.
+                rknpu_profile_writer().emit(
+                    (uint64_t)call_count, node_i, kind, strategy,
+                    M_op, K_seg_op, /*N_total_active=*/N,
+                    type_label, (int)num_active_segments,
+                    /*ac_native=*/0, /*b_native=*/1,
+                    /*ctx_hit=*/-1,  /*b_hit=*/-1,  // per-record hit/miss tracking deferred to follow-up; global counts in RKNPU_ROUTE_STATS
+                    iter_t_setup, iter_t_prepA, iter_t_prepC,
+                    iter_t_npu, iter_t_sync_c, iter_t_gather);
+            }
         }
     }
 
-#ifdef GGML_RKNPU2_DEBUG
+    // Phase 1.C: accumulation always-on (timer cost analyzed at ~0.05%).
     t_setup += node_t_setup; t_prepA += node_t_prepA; t_prepC += node_t_prepC;
     t_npu += node_t_npu;
     t_sync_c += node_t_sync_c;
@@ -1339,6 +1513,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     t_gather += (node_t_collect - node_t_sync_c);  // Phase 1 G: derived split
     call_count++;
 
+#ifdef GGML_RKNPU2_DEBUG
     if (call_count > 0 && call_count % 50 == 0) {
         int64_t total = t_setup + t_prepA + t_prepC + t_npu + t_collect;
         if (total > 0) {
@@ -2036,6 +2211,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                 }
                 // dst's head dim must match src1's; we slice both by nb[2].
                 if (op->ne[2] != src1->ne[2]) {
+                    stats.rejected_broadcast_mismatch.fetch_add(1, std::memory_order_relaxed);
                     stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
@@ -2085,6 +2261,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
+                stats.rejected_no_pipeline.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -2092,30 +2269,35 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             // Rejecting zero-dimension ops
             if (src0->ne[0] == 0 || src0->ne[1] == 0 ||
                 src1->ne[0] == 0 || src1->ne[1] == 0) {
+                stats.rejected_zero_dim.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking if activation type matches the supported operation
             if (src1->type != GGML_TYPE_F32) {
+                stats.rejected_type_src1.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for K alignment
             if (src0->ne[0] % pipeline->k_align != 0) {
+                stats.rejected_align_k.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for N alignment
             if (src0->ne[1] % pipeline->n_align != 0) {
+                stats.rejected_align_n.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
 
             // Checking for exact dimensions
             if (src1->ne[0] != src0->ne[0]) {
+                stats.rejected_k_mismatch.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -2124,16 +2306,19 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             // For batched src1 we only require contiguous rows so permuted
             // attention Q (post permute(0,2,1,3)) is acceptable.
             if (!ggml_is_contiguous(src0)) {
+                stats.rejected_contig_src0.fetch_add(1, std::memory_order_relaxed);
                 stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             if (batched_shape) {
                 if (!ggml_is_contiguous_rows(src1)) {
+                    stats.rejected_contig_src1_rows.fetch_add(1, std::memory_order_relaxed);
                     stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
             } else {
                 if (!ggml_is_contiguous(src1)) {
+                    stats.rejected_contig_src1.fetch_add(1, std::memory_order_relaxed);
                     stats.rejected_other.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
