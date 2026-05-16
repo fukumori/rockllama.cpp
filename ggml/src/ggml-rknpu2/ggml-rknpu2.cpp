@@ -59,6 +59,20 @@ static bool rknpu_batched_mm_enabled() {
     return enabled;
 }
 
+// Phase 1 telemetry: opt-in P1 multi-ctx audit log + 9.5 core_mask read-back.
+// When RKNPU_AUDIT_MULTI_CTX=1, log one line per (segment, core, type, domain)
+// ctx creation in get_matmul_ctx / get_dynamic_matmul_ctx. Used to confirm
+// that no two threads share a single ctx with switched core_mask (consensus
+// plan P1). Output to stderr; one line per cache miss, so per-shape cost is
+// bounded by number of distinct ctxs allocated during the run.
+static bool rknpu_audit_multi_ctx_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("RKNPU_AUDIT_MULTI_CTX");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 // F8.5 route counters: per-process atomic stats so any bench / PPL run can
 // answer "where did the batched mul_mat ops actually go?" Used by the codex
 // review criteria. Printed by the backend's free hook (one summary per
@@ -589,6 +603,15 @@ struct ggml_backend_rknpu_context {
             // Handle error
         }
 
+        if (rknpu_audit_multi_ctx_enabled()) {
+            // Phase 1 P1/9.5: log requested core_mask alongside resolved ctx ptr.
+            // The RKNN API has no get_core_mask, so cross-validate via debugfs/load.
+            std::fprintf(stderr,
+                "MULTI_CTX_AUDIT static t=0x%lx off=%zu M=%d K=%d N=%d core=%d type=%d dom=%d ctx_ptr=%p mask_req=0x%x set_ret=%d\n",
+                (unsigned long)tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id,
+                (void*)ctx.get(), (unsigned)core_mask, ret);
+        }
+
         matmul_ctx_cache[key] = ctx;
         return ctx;
     }
@@ -621,6 +644,13 @@ struct ggml_backend_rknpu_context {
         int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
         if (ret != RKNN_SUCC) {
             // Handle error
+        }
+
+        if (rknpu_audit_multi_ctx_enabled()) {
+            std::fprintf(stderr,
+                "MULTI_CTX_AUDIT dynamic M=%d K=%d N=%d core=%d type=%d dom=%d ctx_ptr=%p mask_req=0x%x set_ret=%d\n",
+                M, K, N, core_id, (int)type, (int)domain_id,
+                (void*)ctx.get(), (unsigned)core_mask, ret);
         }
 
         dynamic_matmul_ctx_cache[key] = ctx;
@@ -781,10 +811,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
 
 #ifdef GGML_RKNPU2_DEBUG
-    // Timing accumulators (us)
-    static int64_t t_setup = 0, t_prepA = 0, t_prepC = 0, t_npu = 0, t_collect = 0;
+    // Timing accumulators (us). Phase 1 item G: collect split in sync_c (NPU
+    // dma sync_from_device, serial across cores) and gather (parallel NEON
+    // dequant/scatter over M rows). t_collect kept as the sum for backward
+    // compatibility with the existing 50-call summary.
+    static int64_t t_setup = 0, t_prepA = 0, t_prepC = 0, t_npu = 0,
+                   t_sync_c = 0, t_gather = 0, t_collect = 0;
     static int call_count = 0;
-    int64_t node_t_setup = 0, node_t_prepA = 0, node_t_prepC = 0, node_t_npu = 0, node_t_collect = 0;
+    int64_t node_t_setup = 0, node_t_prepA = 0, node_t_prepC = 0, node_t_npu = 0,
+            node_t_sync_c = 0, node_t_collect = 0;
+    // node_t_gather is derived at aggregation: node_t_collect - node_t_sync_c.
 #endif
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
@@ -1185,6 +1221,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }
 
+#ifdef GGML_RKNPU2_DEBUG
+                auto t5b_start = std::chrono::high_resolution_clock::now();
+                node_t_sync_c += std::chrono::duration_cast<std::chrono::microseconds>(t5b_start - t5_start).count();
+#endif
+
                 const float hadamard_divisor = pipeline->use_hadamard ? (float)K_op : 1.0f;
 
                 #pragma omp parallel for
@@ -1292,7 +1333,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
 #ifdef GGML_RKNPU2_DEBUG
     t_setup += node_t_setup; t_prepA += node_t_prepA; t_prepC += node_t_prepC;
-    t_npu += node_t_npu; t_collect += node_t_collect;
+    t_npu += node_t_npu;
+    t_sync_c += node_t_sync_c;
+    t_collect += node_t_collect;
+    t_gather += (node_t_collect - node_t_sync_c);  // Phase 1 G: derived split
     call_count++;
 
     if (call_count > 0 && call_count % 50 == 0) {
@@ -1300,11 +1344,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (total > 0) {
             int64_t avg_total = total / call_count;
             fprintf(stderr, "\nRKNPU2 profile (%d calls, avg %lld us/call):\n", call_count, (long long)avg_total);
-            fprintf(stderr, "  Setup (ctx+B) : %6.1f%%  %lld us\n", 100.0*t_setup/total, (long long)t_setup/call_count);
-            fprintf(stderr, "  Prep A (quant): %6.1f%%  %lld us\n", 100.0*t_prepA/total, (long long)t_prepA/call_count);
+            fprintf(stderr, "  Setup (ctx+B)  : %6.1f%%  %lld us\n", 100.0*t_setup/total, (long long)t_setup/call_count);
+            fprintf(stderr, "  Prep A (quant) : %6.1f%%  %lld us\n", 100.0*t_prepA/total, (long long)t_prepA/call_count);
             fprintf(stderr, "  Prep C         : %6.1f%%  %lld us\n", 100.0*t_prepC/total, (long long)t_prepC/call_count);
             fprintf(stderr, "  NPU run        : %6.1f%%  %lld us\n", 100.0*t_npu/total, (long long)t_npu/call_count);
-            fprintf(stderr, "  Collect (deq)  : %6.1f%%  %lld us\n", 100.0*t_collect/total, (long long)t_collect/call_count);
+            fprintf(stderr, "  Sync C (DMA)   : %6.1f%%  %lld us  (Phase 1 G: serial sync FROM_DEVICE)\n", 100.0*t_sync_c/total, (long long)t_sync_c/call_count);
+            fprintf(stderr, "  Gather (NEON)  : %6.1f%%  %lld us  (Phase 1 G: parallel dequant/scatter)\n", 100.0*t_gather/total, (long long)t_gather/call_count);
+            fprintf(stderr, "  Collect total  : %6.1f%%  %lld us  (= Sync C + Gather)\n", 100.0*t_collect/total, (long long)t_collect/call_count);
         }
     }
 #endif
